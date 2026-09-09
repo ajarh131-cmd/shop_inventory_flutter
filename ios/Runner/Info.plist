@@ -66,6 +66,7 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-</dict><key>NSCameraUsageDescription</key>
-<string>Камера используется для сканирования штрихкодов товаров.</string>
+        <key>NSCameraUsageDescription</key>
+        <string>Камера используется для сканирования штрихкодов товаров.</string>
+</dict>
 </plist>
