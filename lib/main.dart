@@ -545,18 +545,32 @@ class DB {
       args.add(seller);
     }
 
-    if (period == 'today') {
-      conditions.add(
-        "date(created_at, 'localtime') = date('now', 'localtime')",
-      );
-    } else if (period == 'week') {
-      conditions.add(
-        "date(created_at, 'localtime') >= date('now', 'localtime', '-6 day')",
-      );
-    } else if (period == 'month') {
-      conditions.add(
-        "date(created_at, 'localtime') >= date('now', 'localtime', 'start of month')",
-      );
+    if (period != 'all') {
+      final now = DateTime.now();
+      late final DateTime start;
+      late final DateTime end;
+
+      if (period == 'today') {
+        start = DateTime(now.year, now.month, now.day);
+        end = start.add(const Duration(days: 1));
+      } else if (period == 'week') {
+        end = DateTime(now.year, now.month, now.day).add(
+          const Duration(days: 1),
+        );
+        start = end.subtract(const Duration(days: 7));
+      } else if (period == 'month') {
+        start = DateTime(now.year, now.month);
+        end = now.month == 12
+            ? DateTime(now.year + 1, 1)
+            : DateTime(now.year, now.month + 1);
+      } else {
+        start = DateTime(2000);
+        end = DateTime(2100);
+      }
+
+      conditions.add("datetime(created_at) >= datetime(?) AND datetime(created_at) < datetime(?)");
+      args.add(start.toIso8601String());
+      args.add(end.toIso8601String());
     }
 
     final where = conditions.isEmpty
@@ -574,7 +588,11 @@ class DB {
           CASE WHEN operation_type = 'Продажа'
           THEN total ELSE 0 END
         ), 0) AS revenue,
-        COALESCE(SUM(profit), 0) AS profit,
+        COALESCE(SUM(
+          CASE
+            WHEN operation_type IN ('Продажа', 'Возврат')
+            THEN profit ELSE 0 END
+        ), 0) AS profit,
         COALESCE(SUM(
           CASE WHEN operation_type = 'Возврат'
           THEN total ELSE 0 END
@@ -599,15 +617,34 @@ class DB {
   ) async {
     String dateCondition = '';
 
-    if (period == 'today') {
-      dateCondition =
-          " AND date(created_at, 'localtime') = date('now', 'localtime')";
-    } else if (period == 'week') {
-      dateCondition =
-          " AND date(created_at, 'localtime') >= date('now', 'localtime', '-6 day')";
-    } else if (period == 'month') {
-      dateCondition =
-          " AND date(created_at, 'localtime') >= date('now', 'localtime', 'start of month')";
+    final args = <Object?>[];
+
+    if (period != 'all') {
+      final now = DateTime.now();
+      late final DateTime start;
+      late final DateTime end;
+
+      if (period == 'today') {
+        start = DateTime(now.year, now.month, now.day);
+        end = start.add(const Duration(days: 1));
+      } else if (period == 'week') {
+        end = DateTime(now.year, now.month, now.day).add(
+          const Duration(days: 1),
+        );
+        start = end.subtract(const Duration(days: 7));
+      } else if (period == 'month') {
+        start = DateTime(now.year, now.month);
+        end = now.month == 12
+            ? DateTime(now.year + 1, 1)
+            : DateTime(now.year, now.month + 1);
+      } else {
+        start = DateTime(2000);
+        end = DateTime(2100);
+      }
+
+      dateCondition = ' AND datetime(created_at) >= datetime(?) AND datetime(created_at) < datetime(?)';
+      args.add(start.toIso8601String());
+      args.add(end.toIso8601String());
     }
 
     return db!.rawQuery(
@@ -635,6 +672,7 @@ class DB {
       GROUP BY seller
       ORDER BY revenue DESC
       ''',
+      args,
     );
   }
 
@@ -643,34 +681,6 @@ class DB {
       'users',
       orderBy: 'full_name COLLATE NOCASE',
     );
-  }
-
-  Future<bool> changePassword({
-    required String username,
-    required String currentPassword,
-    required String newPassword,
-  }) async {
-    final rows = await db!.query(
-      'users',
-      columns: ['id'],
-      where: 'username = ? AND password_hash = ? AND active = 1',
-      whereArgs: [
-        username.trim(),
-        hashPassword(currentPassword),
-      ],
-      limit: 1,
-    );
-
-    if (rows.isEmpty) return false;
-
-    await db!.update(
-      'users',
-      {'password_hash': hashPassword(newPassword)},
-      where: 'id = ?',
-      whereArgs: [rows.first['id']],
-    );
-
-    return true;
   }
 
   Future<void> saveUser(Map<String, dynamic> user) async {
@@ -1050,6 +1060,11 @@ class _HomeState extends State<Home> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          tooltip: 'Скрыть клавиатуру',
+          onPressed: () => FocusManager.instance.primaryFocus?.unfocus(),
+          icon: const Icon(Icons.keyboard_hide),
+        ),
         title: const Text(
           'Главная',
           style: TextStyle(
@@ -1241,6 +1256,11 @@ class _ProductsState extends State<Products> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          tooltip: 'Скрыть клавиатуру',
+          onPressed: () => FocusManager.instance.primaryFocus?.unfocus(),
+          icon: const Icon(Icons.keyboard_hide),
+        ),
         title: const Text(
           'Товары',
           style: TextStyle(
@@ -1742,6 +1762,11 @@ class _SaleState extends State<Sale> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          tooltip: 'Скрыть клавиатуру',
+          onPressed: () => FocusManager.instance.primaryFocus?.unfocus(),
+          icon: const Icon(Icons.keyboard_hide),
+        ),
         title: const Text(
           'Продажа',
           style: TextStyle(
@@ -2018,7 +2043,18 @@ class _StatsState extends State<Stats> {
   @override
   void initState() {
     super.initState();
+    inventoryVersion.addListener(_inventoryChanged);
     load();
+  }
+
+  void _inventoryChanged() {
+    if (mounted) load();
+  }
+
+  @override
+  void dispose() {
+    inventoryVersion.removeListener(_inventoryChanged);
+    super.dispose();
   }
 
   Future<void> load() async {
@@ -2061,6 +2097,11 @@ class _StatsState extends State<Stats> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          tooltip: 'Скрыть клавиатуру',
+          onPressed: () => FocusManager.instance.primaryFocus?.unfocus(),
+          icon: const Icon(Icons.keyboard_hide),
+        ),
         title: const Text('Статистика'),
       ),
       body: RefreshIndicator(
@@ -2273,6 +2314,11 @@ class More extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
+        leading: IconButton(
+          tooltip: 'Скрыть клавиатуру',
+          onPressed: () => FocusManager.instance.primaryFocus?.unfocus(),
+          icon: const Icon(Icons.keyboard_hide),
+        ),
         title: const Text('Ещё'),
       ),
       body: ListView(
@@ -2290,27 +2336,6 @@ class More extends StatelessWidget {
                 '@${user['username']}',
               ),
             ),
-          ),
-          MoreAction(
-            title: 'Сменить пароль',
-            icon: Icons.lock_reset,
-            onTap: () async {
-              final changed = await showModalBottomSheet<bool>(
-                context: context,
-                isScrollControlled: true,
-                builder: (_) => ChangePasswordForm(
-                  username: user['username'].toString(),
-                ),
-              );
-
-              if (!context.mounted || changed != true) return;
-
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('Пароль успешно изменён'),
-                ),
-              );
-            },
           ),
           MoreAction(
             title: 'Кассовая смена',
@@ -2416,172 +2441,6 @@ class More extends StatelessWidget {
             label: const Text('Выйти'),
           ),
         ],
-      ),
-    );
-  }
-}
-
-class ChangePasswordForm extends StatefulWidget {
-  final String username;
-
-  const ChangePasswordForm({
-    super.key,
-    required this.username,
-  });
-
-  @override
-  State<ChangePasswordForm> createState() => _ChangePasswordFormState();
-}
-
-class _ChangePasswordFormState extends State<ChangePasswordForm> {
-  late final TextEditingController currentPassword;
-  late final TextEditingController newPassword;
-  late final TextEditingController confirmPassword;
-  bool saving = false;
-
-  @override
-  void initState() {
-    super.initState();
-    currentPassword = TextEditingController();
-    newPassword = TextEditingController();
-    confirmPassword = TextEditingController();
-  }
-
-  @override
-  void dispose() {
-    currentPassword.dispose();
-    newPassword.dispose();
-    confirmPassword.dispose();
-    super.dispose();
-  }
-
-  Future<void> save() async {
-    if (saving) return;
-
-    final current = currentPassword.text;
-    final next = newPassword.text;
-    final confirm = confirmPassword.text;
-
-    if (current.isEmpty || next.isEmpty || confirm.isEmpty) {
-      _showError('Заполните все поля');
-      return;
-    }
-
-    if (next.length < 6) {
-      _showError('Новый пароль должен содержать минимум 6 символов');
-      return;
-    }
-
-    if (next != confirm) {
-      _showError('Новые пароли не совпадают');
-      return;
-    }
-
-    if (current == next) {
-      _showError('Новый пароль должен отличаться от текущего');
-      return;
-    }
-
-    setState(() => saving = true);
-
-    try {
-      final changed = await DB.i.changePassword(
-        username: widget.username,
-        currentPassword: current,
-        newPassword: next,
-      );
-
-      if (!mounted) return;
-
-      if (!changed) {
-        setState(() => saving = false);
-        _showError('Текущий пароль введён неверно');
-        return;
-      }
-
-      Navigator.pop(context, true);
-    } catch (error) {
-      if (!mounted) return;
-      setState(() => saving = false);
-      _showError('Не удалось изменить пароль: $error');
-    }
-  }
-
-  void _showError(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: EdgeInsets.fromLTRB(
-        20,
-        20,
-        20,
-        MediaQuery.of(context).viewInsets.bottom + 20,
-      ),
-      child: SingleChildScrollView(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const Text(
-              'Смена пароля',
-              style: TextStyle(
-                fontSize: 22,
-                fontWeight: FontWeight.w900,
-              ),
-            ),
-            const SizedBox(height: 6),
-            Text(
-              '@${widget.username}',
-              style: const TextStyle(color: Colors.white54),
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: currentPassword,
-              obscureText: true,
-              textInputAction: TextInputAction.next,
-              decoration: const InputDecoration(
-                labelText: 'Текущий пароль',
-                prefixIcon: Icon(Icons.lock_outline),
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: newPassword,
-              obscureText: true,
-              textInputAction: TextInputAction.next,
-              decoration: const InputDecoration(
-                labelText: 'Новый пароль',
-                prefixIcon: Icon(Icons.lock_reset),
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: confirmPassword,
-              obscureText: true,
-              textInputAction: TextInputAction.done,
-              onSubmitted: (_) => save(),
-              decoration: const InputDecoration(
-                labelText: 'Повторите новый пароль',
-                prefixIcon: Icon(Icons.check_circle_outline),
-              ),
-            ),
-            const SizedBox(height: 16),
-            FilledButton(
-              onPressed: saving ? null : save,
-              style: FilledButton.styleFrom(
-                minimumSize: const Size.fromHeight(52),
-              ),
-              child: Text(
-                saving ? 'Сохранение...' : 'Изменить пароль',
-              ),
-            ),
-          ],
-        ),
       ),
     );
   }
