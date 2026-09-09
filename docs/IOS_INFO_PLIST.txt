@@ -1,0 +1,2 @@
+<key>NSCameraUsageDescription</key>
+<string>Камера используется для сканирования штрихкодов товаров.</string>
