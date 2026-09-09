@@ -32,8 +32,13 @@ jobs:
       - name: Build iOS
         run: flutter build ios --release --no-codesign
 
+      - name: Archive iOS build
+        run: |
+          cd build/ios/iphoneos
+          zip -r shop-inventory-ios.zip Runner.app
+
       - name: Upload iOS build
         uses: actions/upload-artifact@v6
         with:
           name: shop-inventory-ios
-          path: build/ios/iphoneos/Runner.app
+          path: build/ios/iphoneos/shop-inventory-ios.zip
