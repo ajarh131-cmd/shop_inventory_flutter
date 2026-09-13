@@ -810,18 +810,38 @@ class DB {
   }
 
   Future<List<Map<String, dynamic>>> dailySales(String seller) async {
-    final args = seller.isEmpty ? <Object?>[] : <Object?>[seller];
+    final conditions = <String>[];
+    final args = <Object?>[];
+
+    if (seller.isNotEmpty) {
+      conditions.add('r.seller = ?');
+      args.add(seller);
+    }
+
+    final where = conditions.isEmpty
+        ? ''
+        : ' WHERE ${conditions.join(' AND ')}';
+
+    // Дневные продажи считаются только по реально оформленным чекам.
     return db!.rawQuery(
       '''
-      SELECT date(datetime(created_at, 'localtime')) AS day,
-             COUNT(*) AS sales,
-             COALESCE(SUM(quantity),0) AS sold,
-             COALESCE(SUM(total),0) AS revenue,
-             COALESCE(SUM(profit),0) AS profit
-      FROM operations
-      WHERE operation_type = 'Продажа'
-      ${seller.isEmpty ? '' : 'AND seller = ?'}
-      GROUP BY date(datetime(created_at, 'localtime'))
+      SELECT
+        date(r.created_at) AS day,
+        COUNT(r.id) AS sales,
+        COALESCE(SUM(it.sold), 0) AS sold,
+        COALESCE(SUM(r.total), 0) AS revenue,
+        COALESCE(SUM(it.profit), 0) AS profit
+      FROM receipts r
+      LEFT JOIN (
+        SELECT
+          receipt_id,
+          SUM(quantity) AS sold,
+          SUM(profit) AS profit
+        FROM receipt_items
+        GROUP BY receipt_id
+      ) it ON it.receipt_id = r.id
+      $where
+      GROUP BY date(r.created_at)
       ORDER BY day DESC
       LIMIT 90
       ''',
@@ -865,18 +885,19 @@ class DB {
     String seller, [
     String period = 'all',
   ]) async {
-    final conditions = <String>[];
-    final args = <Object?>[];
+    final receiptConditions = <String>[];
+    final receiptArgs = <Object?>[];
 
     if (seller.isNotEmpty) {
-      conditions.add('seller = ?');
-      args.add(seller);
+      receiptConditions.add('r.seller = ?');
+      receiptArgs.add(seller);
     }
+
+    DateTime? start;
+    DateTime? end;
 
     if (period != 'all') {
       final now = DateTime.now();
-      late final DateTime start;
-      late final DateTime end;
 
       if (period == 'today') {
         start = DateTime(now.year, now.month, now.day);
@@ -891,36 +912,82 @@ class DB {
         end = now.month == 12
             ? DateTime(now.year + 1, 1)
             : DateTime(now.year, now.month + 1);
-      } else {
-        start = DateTime(2000);
-        end = DateTime(2100);
       }
-
-      conditions.add("datetime(created_at) >= datetime(?) AND datetime(created_at) < datetime(?)");
-      args.add(start.toIso8601String());
-      args.add(end.toIso8601String());
     }
 
-    final where = conditions.isEmpty
-        ? ''
-        : ' WHERE ${conditions.join(' AND ')}';
+    if (start != null && end != null) {
+      receiptConditions.add('r.created_at >= ? AND r.created_at < ?');
+      receiptArgs.add(start.toIso8601String());
+      receiptArgs.add(end.toIso8601String());
+    }
 
-    final row = (await db!.rawQuery(
+    final receiptWhere = receiptConditions.isEmpty
+        ? ''
+        : ' WHERE ${receiptConditions.join(' AND ')}';
+
+    // Реальные продажи и выручка считаются по чекам.
+    final salesRow = (await db!.rawQuery(
       '''
       SELECT
-        COALESCE(SUM(
-          CASE WHEN operation_type = 'Продажа'
-          THEN quantity ELSE 0 END
-        ), 0) AS sold,
-        COALESCE(SUM(
-          CASE WHEN operation_type = 'Продажа'
-          THEN total ELSE 0 END
-        ), 0) AS revenue,
-        COALESCE(SUM(
-          CASE
-            WHEN operation_type IN ('Продажа', 'Возврат')
-            THEN profit ELSE 0 END
-        ), 0) AS profit,
+        COUNT(r.id) AS sales,
+        COALESCE(SUM(r.total), 0) AS revenue
+      FROM receipts r
+      $receiptWhere
+      ''',
+      receiptArgs,
+    )).first;
+
+    final itemConditions = <String>[];
+    final itemArgs = <Object?>[];
+
+    if (seller.isNotEmpty) {
+      itemConditions.add('r.seller = ?');
+      itemArgs.add(seller);
+    }
+
+    if (start != null && end != null) {
+      itemConditions.add('r.created_at >= ? AND r.created_at < ?');
+      itemArgs.add(start.toIso8601String());
+      itemArgs.add(end.toIso8601String());
+    }
+
+    final itemWhere = itemConditions.isEmpty
+        ? ''
+        : ' WHERE ${itemConditions.join(' AND ')}';
+
+    final itemRow = (await db!.rawQuery(
+      '''
+      SELECT
+        COALESCE(SUM(ri.quantity), 0) AS sold,
+        COALESCE(SUM(ri.profit), 0) AS profit
+      FROM receipt_items ri
+      INNER JOIN receipts r ON r.id = ri.receipt_id
+      $itemWhere
+      ''',
+      itemArgs,
+    )).first;
+
+    final operationConditions = <String>[];
+    final operationArgs = <Object?>[];
+
+    if (seller.isNotEmpty) {
+      operationConditions.add('seller = ?');
+      operationArgs.add(seller);
+    }
+
+    if (start != null && end != null) {
+      operationConditions.add('created_at >= ? AND created_at < ?');
+      operationArgs.add(start.toIso8601String());
+      operationArgs.add(end.toIso8601String());
+    }
+
+    final operationWhere = operationConditions.isEmpty
+        ? ''
+        : ' WHERE ${operationConditions.join(' AND ')}';
+
+    final operationRow = (await db!.rawQuery(
+      '''
+      SELECT
         COALESCE(SUM(
           CASE WHEN operation_type = 'Возврат'
           THEN total ELSE 0 END
@@ -930,21 +997,25 @@ class DB {
           THEN quantity ELSE 0 END
         ), 0) AS defects
       FROM operations
-      $where
+      $operationWhere
       ''',
-      args,
+      operationArgs,
     )).first;
 
-    return row.map(
-      (key, value) => MapEntry(key, value as num),
-    );
+    return <String, num>{
+      'sales': (salesRow['sales'] as num?) ?? 0,
+      'sold': (itemRow['sold'] as num?) ?? 0,
+      'revenue': (salesRow['revenue'] as num?) ?? 0,
+      'profit': (itemRow['profit'] as num?) ?? 0,
+      'returns': (operationRow['returns'] as num?) ?? 0,
+      'defects': (operationRow['defects'] as num?) ?? 0,
+    };
   }
 
   Future<List<Map<String, dynamic>>> sellerStats(
     String period,
   ) async {
-    String dateCondition = '';
-
+    final conditions = <String>[];
     final args = <Object?>[];
 
     if (period != 'all') {
@@ -970,34 +1041,34 @@ class DB {
         end = DateTime(2100);
       }
 
-      dateCondition = ' AND datetime(created_at) >= datetime(?) AND datetime(created_at) < datetime(?)';
+      conditions.add('r.created_at >= ? AND r.created_at < ?');
       args.add(start.toIso8601String());
       args.add(end.toIso8601String());
     }
 
+    final where = conditions.isEmpty
+        ? ''
+        : ' WHERE ${conditions.join(' AND ')}';
+
     return db!.rawQuery(
       '''
       SELECT
-        seller,
-        COUNT(DISTINCT CASE WHEN operation_type = 'Продажа'
-          THEN id END) AS sales,
-        COALESCE(SUM(
-          CASE WHEN operation_type = 'Продажа'
-          THEN quantity ELSE 0 END
-        ), 0) AS sold,
-        COALESCE(SUM(
-          CASE WHEN operation_type = 'Продажа'
-          THEN total ELSE 0 END
-        ), 0) AS revenue,
-        COALESCE(SUM(
-          CASE WHEN operation_type = 'Продажа'
-          THEN profit ELSE 0 END
-        ), 0) AS profit
-      FROM operations
-      WHERE seller IS NOT NULL
-        AND seller != ''
-        $dateCondition
-      GROUP BY seller
+        r.seller,
+        COUNT(r.id) AS sales,
+        COALESCE(SUM(it.sold), 0) AS sold,
+        COALESCE(SUM(r.total), 0) AS revenue,
+        COALESCE(SUM(it.profit), 0) AS profit
+      FROM receipts r
+      LEFT JOIN (
+        SELECT
+          receipt_id,
+          SUM(quantity) AS sold,
+          SUM(profit) AS profit
+        FROM receipt_items
+        GROUP BY receipt_id
+      ) it ON it.receipt_id = r.id
+      $where
+      GROUP BY r.seller
       ORDER BY revenue DESC
       ''',
       args,
@@ -1022,6 +1093,60 @@ class DB {
         whereArgs: [user['id']],
       );
     }
+  }
+
+  Future<void> clearAllData() async {
+    final database = db!;
+
+    final photoRows = await database.query(
+      'purchase_photos',
+      columns: ['file_path'],
+    );
+
+    await database.transaction((txn) async {
+      // Рабочие данные удаляем полностью, пользователей оставляем.
+      await txn.delete('receipt_items');
+      await txn.delete('receipts');
+      await txn.delete('operations');
+      await txn.delete('purchase_photos');
+      await txn.delete('purchase_reports');
+      await txn.delete('shifts');
+      await txn.delete('products');
+
+      // Начинаем нумерацию заново после очистки тестовых данных.
+      await txn.rawDelete(
+        "DELETE FROM sqlite_sequence WHERE name IN "
+        "('receipt_items', 'receipts', 'operations', "
+        "'purchase_photos', 'purchase_reports', 'shifts', 'products')",
+      );
+    });
+
+    // Удаляем сохранённые фотографии с устройства.
+    for (final row in photoRows) {
+      final path = row['file_path']?.toString() ?? '';
+      if (path.isEmpty) continue;
+
+      try {
+        final file = File(path);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      } catch (_) {
+        // База уже очищена; отсутствие одного файла не должно мешать очистке.
+      }
+    }
+
+    try {
+      final documents = await getApplicationDocumentsDirectory();
+      final photosDirectory = Directory(
+        p.join(documents.path, 'purchase_photos'),
+      );
+      if (await photosDirectory.exists()) {
+        await photosDirectory.delete(recursive: true);
+      }
+    } catch (_) {}
+
+    notifyInventoryChanged();
   }
 
   Future<void> backup() async {
@@ -3133,6 +3258,101 @@ class More extends StatelessWidget {
               );
             },
           ),
+          if (user['role'] == 'admin')
+            MoreAction(
+              title: 'Очистить все рабочие данные',
+              icon: Icons.delete_forever,
+              onTap: () async {
+                final confirmed = await showDialog<bool>(
+                  context: context,
+                  builder: (dialogContext) => AlertDialog(
+                    title: const Text('Очистить все данные?'),
+                    content: const Text(
+                      'Будут удалены товары, продажи, чеки, операции, '
+                      'закупки, фотографии и смены. Пользователи и аккаунт '
+                      'администратора останутся. Это действие нельзя отменить.',
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(dialogContext, false),
+                        child: const Text('Отмена'),
+                      ),
+                      FilledButton(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: Colors.red,
+                        ),
+                        onPressed: () => Navigator.pop(dialogContext, true),
+                        child: const Text('Продолжить'),
+                      ),
+                    ],
+                  ),
+                );
+
+                if (confirmed != true || !context.mounted) return;
+
+                final keywordController = TextEditingController();
+                final finalConfirmed = await showDialog<bool>(
+                  context: context,
+                  builder: (dialogContext) => AlertDialog(
+                    title: const Text('Последнее подтверждение'),
+                    content: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Text('Для подтверждения введите: УДАЛИТЬ'),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: keywordController,
+                          autofocus: true,
+                          decoration: const InputDecoration(
+                            labelText: 'Подтверждение',
+                          ),
+                        ),
+                      ],
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(dialogContext, false),
+                        child: const Text('Отмена'),
+                      ),
+                      FilledButton(
+                        style: FilledButton.styleFrom(
+                          backgroundColor: Colors.red,
+                        ),
+                        onPressed: () {
+                          if (keywordController.text.trim() == 'УДАЛИТЬ') {
+                            Navigator.pop(dialogContext, true);
+                          }
+                        },
+                        child: const Text('Удалить'),
+                      ),
+                    ],
+                  ),
+                );
+                keywordController.dispose();
+
+                if (finalConfirmed != true || !context.mounted) return;
+
+                try {
+                  await DB.i.clearAllData();
+
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Все рабочие данные очищены. Пользователи сохранены.',
+                      ),
+                    ),
+                  );
+                } catch (error) {
+                  if (!context.mounted) return;
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text('Не удалось очистить данные: $error'),
+                    ),
+                  );
+                }
+              },
+            ),
           const SizedBox(height: 20),
           OutlinedButton.icon(
             onPressed: logout,
