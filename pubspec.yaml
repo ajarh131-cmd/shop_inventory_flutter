@@ -2,10 +2,8 @@ name: shop_inventory
 description: Мобильный учет магазина
 publish_to: "none"
 version: 1.0.0+1
-
 environment:
   sdk: ">=3.7.0 <4.0.0"
-
 dependencies:
   flutter:
     sdk: flutter
@@ -14,12 +12,12 @@ dependencies:
   path: ^1.9.1
   mobile_scanner: ^7.4.0
   crypto: ^3.0.7
-
+  image_picker: ^1.1.2
+  path_provider: ^2.1.5
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
-
 flutter:
   uses-material-design: true
   assets:

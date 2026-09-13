@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
@@ -219,6 +221,26 @@ class DB {
       )
     """);
 
+    await database.execute('''
+      CREATE TABLE IF NOT EXISTS purchase_reports(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        seller TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        purchase_price REAL NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    ''');
+
+    await database.execute('''
+      CREATE TABLE IF NOT EXISTS purchase_photos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_id INTEGER NOT NULL,
+        file_path TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    ''');
+
     await database.execute(
       'CREATE TABLE IF NOT EXISTS shifts('
       'id INTEGER PRIMARY KEY AUTOINCREMENT,'
@@ -325,6 +347,39 @@ class DB {
         whereArgs: [product['id']],
       );
     }
+  }
+
+  Future<int> createPurchaseReport({
+    required int productId,
+    required String seller,
+    required int quantity,
+    required double purchasePrice,
+    List<String> photoPaths = const [],
+  }) async {
+    if (quantity <= 0) return 0;
+    final now = DateTime.now().toIso8601String();
+
+    final reportId = await db!.transaction<int>((transaction) async {
+      final id = await transaction.insert('purchase_reports', {
+        'product_id': productId,
+        'seller': seller,
+        'quantity': quantity,
+        'purchase_price': purchasePrice,
+        'created_at': now,
+      });
+
+      for (final path in photoPaths) {
+        await transaction.insert('purchase_photos', {
+          'report_id': id,
+          'file_path': path,
+          'created_at': now,
+        });
+      }
+
+      return id;
+    });
+
+    return reportId;
   }
 
   Future<int> sale(
@@ -500,22 +555,42 @@ class DB {
   }
 
   Future<List<Map<String, dynamic>>> receipts(
-    String seller,
-  ) async {
-    if (seller.isEmpty) {
-      return db!.query(
-        'receipts',
-        orderBy: 'id DESC',
-        limit: 300,
-      );
+    String seller, {
+    DateTime? from,
+    DateTime? to,
+    String paymentMethod = '',
+  }) async {
+    final conditions = <String>[];
+    final args = <Object?>[];
+
+    if (seller.isNotEmpty) {
+      conditions.add('seller = ?');
+      args.add(seller);
+    }
+
+    if (from != null) {
+      final start = DateTime(from.year, from.month, from.day);
+      conditions.add('datetime(created_at) >= datetime(?)');
+      args.add(start.toIso8601String());
+    }
+
+    if (to != null) {
+      final end = DateTime(to.year, to.month, to.day).add(const Duration(days: 1));
+      conditions.add('datetime(created_at) < datetime(?)');
+      args.add(end.toIso8601String());
+    }
+
+    if (paymentMethod.isNotEmpty) {
+      conditions.add('payment_method = ?');
+      args.add(paymentMethod);
     }
 
     return db!.query(
       'receipts',
-      where: 'seller = ?',
-      whereArgs: [seller],
+      where: conditions.isEmpty ? null : conditions.join(' AND '),
+      whereArgs: conditions.isEmpty ? null : args,
       orderBy: 'id DESC',
-      limit: 300,
+      limit: 500,
     );
   }
 
@@ -608,19 +683,22 @@ class DB {
     notifyInventoryChanged();
   }
 
-  Future<void> purchase(
+  Future<int> purchase(
     int productId,
     int quantity,
     double purchasePrice,
-    String seller,
-  ) async {
+    String seller, {
+    List<String> photoPaths = const [],
+  }) async {
     if (quantity <= 0) throw Exception('Количество должно быть больше нуля');
-    if (purchasePrice < 0) throw Exception('Закупочная цена не может быть отрицательной');
+    if (purchasePrice < 0) {
+      throw Exception('Закупочная цена не может быть отрицательной');
+    }
     if (await currentShift() == null) {
       throw Exception('Смена не открыта. Сначала откройте смену.');
     }
 
-    await db!.transaction((transaction) async {
+    final reportId = await db!.transaction<int>((transaction) async {
       final rows = await transaction.query(
         'products',
         where: 'id = ?',
@@ -633,6 +711,7 @@ class DB {
       final oldQuantity = (product['quantity'] as num).toInt();
       final price = (product['price'] as num).toDouble();
       final cost = purchasePrice * quantity;
+      final now = DateTime.now().toIso8601String();
 
       await transaction.update(
         'products',
@@ -652,15 +731,55 @@ class DB {
         'price': price,
         'discount': 0,
         'total': 0,
-        'created_at': DateTime.now().toIso8601String(),
+        'created_at': now,
         'cost': cost,
         'profit': 0,
         'seller': seller,
         'payment_method': 'Наличные',
       });
+
+      final id = await transaction.insert('purchase_reports', {
+        'product_id': productId,
+        'seller': seller,
+        'quantity': quantity,
+        'purchase_price': purchasePrice,
+        'created_at': now,
+      });
+
+      for (final path in photoPaths) {
+        await transaction.insert('purchase_photos', {
+          'report_id': id,
+          'file_path': path,
+          'created_at': now,
+        });
+      }
+
+      return id;
     });
 
     notifyInventoryChanged();
+    return reportId;
+  }
+
+  Future<List<Map<String, dynamic>>> purchaseReports({
+    String seller = '',
+  }) async {
+    return db!.query(
+      'purchase_reports',
+      where: seller.isEmpty ? null : 'seller = ?',
+      whereArgs: seller.isEmpty ? null : [seller],
+      orderBy: 'id DESC',
+      limit: 300,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> purchasePhotos(int reportId) async {
+    return db!.query(
+      'purchase_photos',
+      where: 'report_id = ?',
+      whereArgs: [reportId],
+      orderBy: 'id ASC',
+    );
   }
 
   Future<List<Map<String, dynamic>>> productHistory(
@@ -1466,7 +1585,10 @@ class _ProductsState extends State<Products> {
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      builder: (_) => ProductForm(product),
+      builder: (_) => ProductForm(
+        product,
+        user: widget.user,
+      ),
     );
 
     if (!mounted) return;
@@ -1591,10 +1713,12 @@ class _ProductsState extends State<Products> {
 
 class ProductForm extends StatefulWidget {
   final Map<String, dynamic>? product;
+  final Map<String, dynamic> user;
 
   const ProductForm(
     this.product, {
     super.key,
+    required this.user,
   });
 
   @override
@@ -1607,6 +1731,10 @@ class _ProductFormState extends State<ProductForm> {
   late final TextEditingController buy;
   late final TextEditingController price;
   late final TextEditingController quantity;
+
+  final picker = ImagePicker();
+  final photos = <XFile>[];
+  bool saving = false;
 
   @override
   void initState() {
@@ -1640,7 +1768,56 @@ class _ProductFormState extends State<ProductForm> {
     super.dispose();
   }
 
+  Future<void> takePhoto() async {
+    try {
+      final photo = await picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 85,
+        maxWidth: 1800,
+      );
+      if (photo == null || !mounted) return;
+      setState(() => photos.add(photo));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Не удалось сделать фото: $e')),
+      );
+    }
+  }
+
+  Future<List<String>> savePhotosLocally() async {
+    if (photos.isEmpty) return [];
+
+    final directory = await getApplicationDocumentsDirectory();
+    final folder = Directory(
+      p.join(directory.path, 'purchase_photos'),
+    );
+    await folder.create(recursive: true);
+
+    final paths = <String>[];
+
+    for (var i = 0; i < photos.length; i++) {
+      final source = File(photos[i].path);
+      final extension = p.extension(photos[i].path).isEmpty
+          ? '.jpg'
+          : p.extension(photos[i].path);
+      final target = File(
+        p.join(
+          folder.path,
+          'purchase_${DateTime.now().microsecondsSinceEpoch}_$i$extension',
+        ),
+      );
+
+      await source.copy(target.path);
+      paths.add(target.path);
+    }
+
+    return paths;
+  }
+
   Future<void> save() async {
+    if (saving) return;
+
     final productName = name.text.trim();
     final productBarcode = barcode.text.trim();
 
@@ -1673,25 +1850,56 @@ class _ProductFormState extends State<ProductForm> {
       return;
     }
 
-    final data = <String, dynamic>{
-      'barcode': productBarcode,
-      'name': productName,
-      'purchase_price': buyPrice,
-      'price': salePrice,
-      'quantity': stock,
-    };
-
-    if (widget.product?['id'] != null) {
-      data['id'] = widget.product!['id'];
-    }
+    setState(() => saving = true);
 
     try {
+      final isNew = widget.product?['id'] == null;
+      final data = <String, dynamic>{
+        'barcode': productBarcode,
+        'name': productName,
+        'purchase_price': buyPrice,
+        'price': salePrice,
+        'quantity': stock,
+      };
+
+      if (!isNew) {
+        data['id'] = widget.product!['id'];
+      }
+
       await DB.i.saveProduct(data);
 
+      if (isNew && stock > 0 && photos.isNotEmpty) {
+        final productRow = await DB.i.product(productBarcode);
+        if (productRow != null) {
+          final paths = await savePhotosLocally();
+
+          await DB.i.createPurchaseReport(
+            productId: productRow['id'] as int,
+            seller: widget.user['username'].toString(),
+            quantity: stock,
+            purchasePrice: buyPrice,
+            photoPaths: paths,
+          );
+        }
+      }
+
       if (!mounted) return;
+
+      if (isNew && stock > 0 && photos.isNotEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Товар добавлен. Фото приёмки: ${photos.length}',
+            ),
+          ),
+        );
+      }
+
       Navigator.pop(context);
     } catch (error) {
       if (!mounted) return;
+
+      setState(() => saving = false);
 
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -1706,6 +1914,7 @@ class _ProductFormState extends State<ProductForm> {
   @override
   Widget build(BuildContext context) {
     final editing = widget.product != null;
+    final canAddReceivingPhotos = !editing;
 
     return Padding(
       padding: EdgeInsets.fromLTRB(
@@ -1776,13 +1985,83 @@ class _ProductFormState extends State<ProductForm> {
                 prefixIcon: Icon(Icons.tag),
               ),
             ),
+            if (canAddReceivingPhotos) ...[
+              const SizedBox(height: 16),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Фото приёмки товара',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w800,
+                      ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  'Фото сохраняются вместе с отчётом о поступлении. '
+                  'Позже подключим загрузку на сервер.',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+              const SizedBox(height: 10),
+              OutlinedButton.icon(
+                onPressed: saving ? null : takePhoto,
+                icon: const Icon(Icons.camera_alt),
+                label: const Text('Сделать фото'),
+              ),
+              if (photos.isNotEmpty) ...[
+                const SizedBox(height: 10),
+                SizedBox(
+                  height: 110,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: photos.length,
+                    separatorBuilder: (_, _) =>
+                        const SizedBox(width: 8),
+                    itemBuilder: (_, index) => Stack(
+                      children: [
+                        ClipRRect(
+                          borderRadius:
+                              BorderRadius.circular(12),
+                          child: Image.file(
+                            File(photos[index].path),
+                            width: 110,
+                            height: 110,
+                            fit: BoxFit.cover,
+                          ),
+                        ),
+                        Positioned(
+                          top: 4,
+                          right: 4,
+                          child: IconButton.filled(
+                            onPressed: saving
+                                ? null
+                                : () => setState(
+                                      () => photos.removeAt(index),
+                                    ),
+                            icon: const Icon(
+                              Icons.close,
+                              size: 18,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ],
+            ],
             const SizedBox(height: 14),
             FilledButton(
-              onPressed: save,
+              onPressed: saving ? null : save,
               style: FilledButton.styleFrom(
                 minimumSize: const Size.fromHeight(54),
               ),
-              child: const Text('Сохранить'),
+              child: Text(
+                saving ? 'Сохранение...' : 'Сохранить',
+              ),
             ),
           ],
         ),
@@ -2265,6 +2544,11 @@ class _SaleState extends State<Sale> {
                         value: 'Карта',
                         label: Text('Карта'),
                         icon: Icon(Icons.credit_card),
+                      ),
+                      ButtonSegment(
+                        value: 'Перевод',
+                        label: Text('Перевод'),
+                        icon: Icon(Icons.account_balance),
                       ),
                     ],
                     selected: {paymentMethod},
@@ -3157,148 +3441,205 @@ class Receipts extends StatefulWidget {
 }
 
 class _ReceiptsState extends State<Receipts> {
+  DateTime? from;
+  DateTime? to;
+  String paymentMethod = '';
   late Future<List<Map<String, dynamic>>> future;
+
+  String get seller => widget.user['role'] == 'admin'
+      ? ''
+      : widget.user['username'].toString();
 
   @override
   void initState() {
     super.initState();
+    _reload();
+  }
+
+  void _reload() {
     future = DB.i.receipts(
-      widget.user['role'] == 'admin'
-          ? ''
-          : widget.user['username'].toString(),
+      seller,
+      from: from,
+      to: to,
+      paymentMethod: paymentMethod,
     );
   }
 
   Future<void> refresh() async {
-    setState(() {
-      future = DB.i.receipts(
-        widget.user['role'] == 'admin'
-            ? ''
-            : widget.user['username'].toString(),
-      );
-    });
+    setState(_reload);
     await future;
   }
 
-  String receiptNumber(int id) {
-    return '#${id.toString().padLeft(6, '0')}';
+  Future<void> pickFrom() async {
+    final value = await showDatePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now(),
+      initialDate: from ?? DateTime.now(),
+    );
+    if (value == null) return;
+    setState(() {
+      from = value;
+      if (to != null && to!.isBefore(value)) to = value;
+      _reload();
+    });
   }
+
+  Future<void> pickTo() async {
+    final value = await showDatePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: DateTime.now(),
+      initialDate: to ?? DateTime.now(),
+    );
+    if (value == null) return;
+    setState(() {
+      to = value;
+      if (from != null && from!.isAfter(value)) from = value;
+      _reload();
+    });
+  }
+
+  String dateLabel(DateTime? value) {
+    if (value == null) return 'Дата';
+    return '${value.day.toString().padLeft(2, '0')}.${value.month.toString().padLeft(2, '0')}.${value.year}';
+  }
+
+  String receiptNumber(int id) => '#${id.toString().padLeft(6, '0')}';
 
   @override
   Widget build(BuildContext context) {
     if (!hasPermission(widget.user, 'receipts')) {
       return Scaffold(
         appBar: AppBar(title: const Text('Чеки')),
-        body: const Center(
-          child: Text('У вас нет доступа к чекам.'),
-        ),
+        body: const Center(child: Text('У вас нет доступа к чекам.')),
       );
     }
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Чеки'),
-      ),
-      body: FutureBuilder<List<Map<String, dynamic>>>(
-        future: future,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(
-              child: CircularProgressIndicator(),
-            );
-          }
-
-          if (snapshot.hasError) {
-            return Center(
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Text(
-                  'Ошибка: ${snapshot.error}',
-                  textAlign: TextAlign.center,
-                ),
-              ),
-            );
-          }
-
-          final items = snapshot.data ?? [];
-
-          if (items.isEmpty) {
-            return RefreshIndicator(
-              onRefresh: refresh,
-              child: ListView(
-                children: const [
-                  SizedBox(height: 180),
-                  Center(
-                    child: Text(
-                      'Чеков пока нет',
-                      style: TextStyle(
-                        color: Colors.white54,
+      appBar: AppBar(title: const Text('Чеки')),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: pickFrom,
+                        icon: const Icon(Icons.calendar_today),
+                        label: Text('От: ${dateLabel(from)}'),
                       ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: pickTo,
+                        icon: const Icon(Icons.calendar_today),
+                        label: Text('До: ${dateLabel(to)}'),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(value: '', label: Text('Все')),
+                      ButtonSegment(value: 'Наличные', label: Text('Наличные')),
+                      ButtonSegment(value: 'Карта', label: Text('Карта')),
+                      ButtonSegment(value: 'Перевод', label: Text('Перевод')),
+                    ],
+                    selected: {paymentMethod},
+                    onSelectionChanged: (value) {
+                      setState(() {
+                        paymentMethod = value.first;
+                        _reload();
+                      });
+                    },
+                  ),
+                ),
+                if (from != null || to != null || paymentMethod.isNotEmpty)
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: () {
+                        setState(() {
+                          from = null;
+                          to = null;
+                          paymentMethod = '';
+                          _reload();
+                        });
+                      },
+                      icon: const Icon(Icons.clear),
+                      label: const Text('Сбросить фильтры'),
                     ),
                   ),
-                ],
-              ),
-            );
-          }
-
-          return RefreshIndicator(
-            onRefresh: refresh,
-            child: ListView.builder(
-              padding: const EdgeInsets.all(12),
-              itemCount: items.length,
-              itemBuilder: (_, index) {
-                final receipt = items[index];
-                final id = (receipt['id'] as num).toInt();
-                final total =
-                    (receipt['total'] as num?)?.toDouble() ?? 0;
-                final seller =
-                    receipt['seller']?.toString() ?? '';
-                final created =
-                    receipt['created_at']?.toString() ?? '';
-
-                return Card(
-                  child: ListTile(
-                    leading: CircleAvatar(
-                      backgroundColor: const Color(0xff4f3b86),
-                      child: const Icon(Icons.receipt_long),
+              ],
+            ),
+          ),
+          Expanded(
+            child: FutureBuilder<List<Map<String, dynamic>>>(
+              future: future,
+              builder: (context, snapshot) {
+                if (snapshot.connectionState != ConnectionState.done) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+                if (snapshot.hasError) {
+                  return Center(child: Text('Ошибка: ${snapshot.error}'));
+                }
+                final items = snapshot.data ?? [];
+                if (items.isEmpty) {
+                  return RefreshIndicator(
+                    onRefresh: refresh,
+                    child: ListView(
+                      children: const [
+                        SizedBox(height: 160),
+                        Center(child: Text('Чеков по выбранным фильтрам нет')),
+                      ],
                     ),
-                    title: Text(
-                      'Чек ${receiptNumber(id)}',
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                    subtitle: Text(
-                      '${seller.isEmpty ? 'Продавец не указан' : seller} • '
-                      '${receipt['payment_method'] ?? 'Наличные'}\n'
-                      '${formatDateTime(created)}',
-                    ),
-                    isThreeLine: true,
-                    trailing: Text(
-                      money(total),
-                      style: const TextStyle(
-                        fontWeight: FontWeight.w900,
-                      ),
-                    ),
-                    onTap: () async {
-                      await Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => ReceiptDetail(
-                            receiptId: id,
+                  );
+                }
+                return RefreshIndicator(
+                  onRefresh: refresh,
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: items.length,
+                    itemBuilder: (_, index) {
+                      final receipt = items[index];
+                      final id = (receipt['id'] as num).toInt();
+                      final total = (receipt['total'] as num?)?.toDouble() ?? 0;
+                      final seller = receipt['seller']?.toString() ?? '';
+                      final created = receipt['created_at']?.toString() ?? '';
+                      return Card(
+                        child: ListTile(
+                          leading: const CircleAvatar(child: Icon(Icons.receipt_long)),
+                          title: Text('Чек ${receiptNumber(id)}', style: const TextStyle(fontWeight: FontWeight.w900)),
+                          subtitle: Text(
+                            '${seller.isEmpty ? 'Продавец не указан' : seller} • ${receipt['payment_method'] ?? 'Наличные'}\n${formatDateTime(created)}',
                           ),
+                          isThreeLine: true,
+                          trailing: Text(money(total), style: const TextStyle(fontWeight: FontWeight.w900)),
+                          onTap: () async {
+                            await Navigator.push(
+                              context,
+                              MaterialPageRoute(builder: (_) => ReceiptDetail(receiptId: id)),
+                            );
+                            if (!mounted) return;
+                            await refresh();
+                          },
                         ),
                       );
-
-                      if (!mounted) return;
-                      await refresh();
                     },
                   ),
                 );
               },
             ),
-          );
-        },
+          ),
+        ],
       ),
     );
   }
@@ -4053,44 +4394,103 @@ class _PurchasePageState extends State<PurchasePage> {
   final search = TextEditingController();
   final qty = TextEditingController(text: '1');
   final buy = TextEditingController();
+  final picker = ImagePicker();
   List<Map<String, dynamic>> results = [];
   Map<String, dynamic>? product;
+  final photos = <XFile>[];
+  bool saving = false;
 
   @override
   void dispose() {
-    search.dispose(); qty.dispose(); buy.dispose(); super.dispose();
+    search.dispose();
+    qty.dispose();
+    buy.dispose();
+    super.dispose();
   }
 
   Future<void> find(String value) async {
     final q = value.trim();
-    if (q.isEmpty) { if (mounted) setState(() => results = []); return; }
+    if (q.isEmpty) {
+      if (mounted) setState(() => results = []);
+      return;
+    }
     final r = await DB.i.products(q);
     if (!mounted || search.text.trim() != q) return;
     setState(() => results = r);
   }
 
   void select(Map<String, dynamic> p) {
-    setState(() { product = p; results = []; });
+    setState(() {
+      product = p;
+      results = [];
+    });
     search.text = p['name'].toString();
     buy.text = ((p['purchase_price'] as num?)?.toDouble() ?? 0).toString();
   }
 
+  Future<void> takePhoto() async {
+    try {
+      final photo = await picker.pickImage(
+        source: ImageSource.camera,
+        imageQuality: 85,
+        maxWidth: 1800,
+      );
+      if (photo == null || !mounted) return;
+      setState(() => photos.add(photo));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Не удалось сделать фото: $e')));
+    }
+  }
+
+  Future<List<String>> savePhotosLocally() async {
+    if (photos.isEmpty) return [];
+    final directory = await getApplicationDocumentsDirectory();
+    final folder = Directory(p.join(directory.path, 'purchase_photos'));
+    await folder.create(recursive: true);
+    final paths = <String>[];
+    for (var i = 0; i < photos.length; i++) {
+      final source = File(photos[i].path);
+      final extension = p.extension(photos[i].path).isEmpty ? '.jpg' : p.extension(photos[i].path);
+      final target = File(
+        p.join(folder.path, 'purchase_${DateTime.now().microsecondsSinceEpoch}_$i$extension'),
+      );
+      await source.copy(target.path);
+      paths.add(target.path);
+    }
+    return paths;
+  }
+
   Future<void> save() async {
-    final p = product;
-    if (p == null) return;
+    final pdt = product;
+    if (pdt == null || saving) return;
     final count = int.tryParse(qty.text.trim()) ?? 0;
     final price = double.tryParse(buy.text.replaceAll(',', '.')) ?? -1;
     if (count <= 0 || price < 0) {
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Проверьте количество и закупочную цену')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Проверьте количество и закупочную цену')),
+      );
       return;
     }
+
+    setState(() => saving = true);
     try {
-      await DB.i.purchase(p['id'] as int, count, price, widget.user['username'].toString());
+      final paths = await savePhotosLocally();
+      await DB.i.purchase(
+        pdt['id'] as int,
+        count,
+        price,
+        widget.user['username'].toString(),
+        photoPaths: paths,
+      );
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Закупка добавлена')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Закупка добавлена. Фото: ${paths.length}')),
+      );
       Navigator.pop(context);
     } catch (e) {
       if (!mounted) return;
+      setState(() => saving = false);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
     }
   }
@@ -4098,25 +4498,125 @@ class _PurchasePageState extends State<PurchasePage> {
   @override
   Widget build(BuildContext context) {
     if (!hasPermission(widget.user, 'purchases')) {
-      return Scaffold(appBar: AppBar(title: const Text('Закупка')), body: const Center(child: Text('У вас нет права на закупки.')));
+      return Scaffold(
+        appBar: AppBar(title: const Text('Закупка')),
+        body: const Center(child: Text('У вас нет права на закупки.')),
+      );
     }
+
     return Scaffold(
       appBar: AppBar(title: const Text('Дополнительная закупка')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          TextField(controller: search, onChanged: find, decoration: const InputDecoration(labelText: 'Товар: название или штрихкод', prefixIcon: Icon(Icons.search))),
+          TextField(
+            controller: search,
+            onChanged: find,
+            decoration: const InputDecoration(
+              labelText: 'Товар: название или штрихкод',
+              prefixIcon: Icon(Icons.search),
+            ),
+          ),
           if (results.isNotEmpty)
-            Card(child: Column(children: results.map((p) => ListTile(title: Text(p['name'].toString()), subtitle: Text('${p['barcode']} • Остаток: ${p['quantity']}'), onTap: () => select(p))).toList())),
+            Card(
+              child: Column(
+                children: results
+                    .map(
+                      (p) => ListTile(
+                        title: Text(p['name'].toString()),
+                        subtitle: Text('${p['barcode']} • Остаток: ${p['quantity']}'),
+                        onTap: () => select(p),
+                      ),
+                    )
+                    .toList(),
+              ),
+            ),
           if (product != null) ...[
             const SizedBox(height: 12),
-            Card(child: ListTile(title: Text(product!['name'].toString()), subtitle: Text('Текущий остаток: ${product!['quantity']} шт.'))),
+            Card(
+              child: ListTile(
+                title: Text(product!['name'].toString()),
+                subtitle: Text('Текущий остаток: ${product!['quantity']} шт.'),
+              ),
+            ),
             const SizedBox(height: 12),
-            TextField(controller: qty, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Количество', prefixIcon: Icon(Icons.add_box))),
+            TextField(
+              controller: qty,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Количество',
+                prefixIcon: Icon(Icons.add_box),
+              ),
+            ),
             const SizedBox(height: 10),
-            TextField(controller: buy, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Закупочная цена за 1 шт.', prefixIcon: Icon(Icons.shopping_cart))),
-            const SizedBox(height: 16),
-            FilledButton(onPressed: save, style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)), child: const Text('Добавить закупку')),
+            TextField(
+              controller: buy,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(
+                labelText: 'Закупочная цена за 1 шт.',
+                prefixIcon: Icon(Icons.payments_outlined),
+              ),
+            ),
+            const SizedBox(height: 18),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(14),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Фотоотчёт', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
+                    const SizedBox(height: 6),
+                    const Text('Сфотографируйте товар или поставку. Фото пока сохраняются на телефоне; сервер подключим следующим этапом.'),
+                    const SizedBox(height: 12),
+                    if (photos.isNotEmpty)
+                      SizedBox(
+                        height: 110,
+                        child: ListView.separated(
+                          scrollDirection: Axis.horizontal,
+                          itemCount: photos.length,
+                          separatorBuilder: (_, _) => const SizedBox(width: 8),
+                          itemBuilder: (_, index) => Stack(
+                            children: [
+                              ClipRRect(
+                                borderRadius: BorderRadius.circular(12),
+                                child: Image.file(
+                                  File(photos[index].path),
+                                  width: 110,
+                                  height: 110,
+                                  fit: BoxFit.cover,
+                                ),
+                              ),
+                              Positioned(
+                                top: 4,
+                                right: 4,
+                                child: IconButton.filled(
+                                  onPressed: () => setState(() => photos.removeAt(index)),
+                                  icon: const Icon(Icons.close, size: 18),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 10),
+                    OutlinedButton.icon(
+                      onPressed: saving ? null : takePhoto,
+                      icon: const Icon(Icons.camera_alt),
+                      label: Text(photos.isEmpty ? 'Сделать фото' : 'Добавить фото'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 18),
+            FilledButton.icon(
+              onPressed: saving ? null : save,
+              icon: saving
+                  ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.check),
+              label: const Text('Принять товар'),
+              style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)),
+            ),
           ],
         ],
       ),
