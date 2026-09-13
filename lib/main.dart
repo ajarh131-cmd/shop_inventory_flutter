@@ -37,6 +37,60 @@ String hashPassword(String value) {
   return sha256.convert(utf8.encode(value)).toString();
 }
 
+const sellerPermissionDefaults = <String, bool>{
+  'sell': true,
+  'returns': true,
+  'defects': true,
+  'products_view': true,
+  'products_edit': false,
+  'stats': true,
+  'profit': false,
+  'shift': true,
+  'history': true,
+  'receipts': true,
+  'backup': false,
+  'purchases': false,
+  'product_history': true,
+};
+
+const permissionLabels = <String, String>{
+  'sell': 'Продажи',
+  'returns': 'Возвраты',
+  'defects': 'Списание брака',
+  'products_view': 'Просмотр товаров',
+  'products_edit': 'Добавление и изменение товаров',
+  'stats': 'Статистика',
+  'profit': 'Видеть прибыль и закупочные цены',
+  'shift': 'Кассовая смена',
+  'history': 'История операций',
+  'receipts': 'Чеки',
+  'backup': 'Резервная копия',
+  'purchases': 'Закупки и пополнение товара',
+  'product_history': 'История товара',
+};
+
+Map<String, bool> decodePermissions(Object? raw) {
+  final result = <String, bool>{...sellerPermissionDefaults};
+  if (raw is String && raw.trim().isNotEmpty) {
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) {
+        for (final key in sellerPermissionDefaults.keys) {
+          if (decoded[key] is bool) {
+            result[key] = decoded[key] as bool;
+          }
+        }
+      }
+    } catch (_) {}
+  }
+  return result;
+}
+
+bool hasPermission(Map<String, dynamic> user, String permission) {
+  if (user['role']?.toString() == 'admin') return true;
+  return decodePermissions(user['permissions'])[permission] ?? false;
+}
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await DB.i.open();
@@ -90,6 +144,13 @@ class DB {
       "TEXT DEFAULT ''",
     );
 
+    await _ensureColumn(
+      database,
+      'operations',
+      'payment_method',
+      "TEXT DEFAULT 'Наличные'",
+    );
+
     await database.execute("""
       CREATE TABLE IF NOT EXISTS users(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,6 +163,28 @@ class DB {
       )
     """);
 
+    await _ensureColumn(
+      database,
+      'users',
+      'permissions',
+      "TEXT DEFAULT ''",
+    );
+
+    final sellersWithoutPermissions = await database.query(
+      'users',
+      columns: ['id'],
+      where: "role = 'seller' AND (permissions IS NULL OR permissions = '')",
+    );
+
+    for (final seller in sellersWithoutPermissions) {
+      await database.update(
+        'users',
+        {'permissions': jsonEncode(sellerPermissionDefaults)},
+        where: 'id = ?',
+        whereArgs: [seller['id']],
+      );
+    }
+
     await database.execute("""
       CREATE TABLE IF NOT EXISTS receipts(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +195,13 @@ class DB {
         created_at TEXT NOT NULL
       )
     """);
+
+    await _ensureColumn(
+      database,
+      'receipts',
+      'payment_method',
+      "TEXT DEFAULT 'Наличные'",
+    );
 
     await database.execute("""
       CREATE TABLE IF NOT EXISTS receipt_items(
@@ -241,6 +331,7 @@ class DB {
     List<CartItem> cart,
     double discount,
     String seller,
+    String paymentMethod,
   ) async {
     if (cart.isEmpty) return 0;
 
@@ -262,6 +353,7 @@ class DB {
         'subtotal': subtotal,
         'discount': discountAmount,
         'total': receiptTotal,
+        'payment_method': paymentMethod,
         'created_at': DateTime.now().toIso8601String(),
       });
 
@@ -321,6 +413,7 @@ class DB {
           'cost': cost,
           'profit': profit,
           'seller': seller,
+          'payment_method': paymentMethod,
         });
       }
 
@@ -515,19 +608,135 @@ class DB {
     notifyInventoryChanged();
   }
 
-  Future<List<Map<String, dynamic>>> ops(String seller) async {
-    if (seller.isEmpty) {
-      return db!.query(
-        'operations',
-        orderBy: 'id DESC',
-        limit: 300,
+  Future<void> purchase(
+    int productId,
+    int quantity,
+    double purchasePrice,
+    String seller,
+  ) async {
+    if (quantity <= 0) throw Exception('Количество должно быть больше нуля');
+    if (purchasePrice < 0) throw Exception('Закупочная цена не может быть отрицательной');
+    if (await currentShift() == null) {
+      throw Exception('Смена не открыта. Сначала откройте смену.');
+    }
+
+    await db!.transaction((transaction) async {
+      final rows = await transaction.query(
+        'products',
+        where: 'id = ?',
+        whereArgs: [productId],
+        limit: 1,
       );
+      if (rows.isEmpty) throw Exception('Товар не найден');
+
+      final product = rows.first;
+      final oldQuantity = (product['quantity'] as num).toInt();
+      final price = (product['price'] as num).toDouble();
+      final cost = purchasePrice * quantity;
+
+      await transaction.update(
+        'products',
+        {
+          'quantity': oldQuantity + quantity,
+          'purchase_price': purchasePrice,
+        },
+        where: 'id = ?',
+        whereArgs: [productId],
+      );
+
+      await transaction.insert('operations', {
+        'operation_type': 'Закупка',
+        'barcode': product['barcode'],
+        'product_name': product['name'],
+        'quantity': quantity,
+        'price': price,
+        'discount': 0,
+        'total': 0,
+        'created_at': DateTime.now().toIso8601String(),
+        'cost': cost,
+        'profit': 0,
+        'seller': seller,
+        'payment_method': 'Наличные',
+      });
+    });
+
+    notifyInventoryChanged();
+  }
+
+  Future<List<Map<String, dynamic>>> productHistory(
+    int productId,
+    String seller,
+  ) async {
+    final productRows = await db!.query(
+      'products',
+      where: 'id = ?',
+      whereArgs: [productId],
+      limit: 1,
+    );
+    if (productRows.isEmpty) throw Exception('Товар не найден');
+    final name = productRows.first['name'].toString();
+    final conditions = <String>['product_name = ?'];
+    final args = <Object?>[name];
+    if (seller.isNotEmpty) {
+      conditions.add('seller = ?');
+      args.add(seller);
+    }
+    return db!.query(
+      'operations',
+      where: conditions.join(' AND '),
+      whereArgs: args,
+      orderBy: 'id DESC',
+      limit: 500,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> dailySales(String seller) async {
+    final args = seller.isEmpty ? <Object?>[] : <Object?>[seller];
+    return db!.rawQuery(
+      '''
+      SELECT date(datetime(created_at, 'localtime')) AS day,
+             COUNT(*) AS sales,
+             COALESCE(SUM(quantity),0) AS sold,
+             COALESCE(SUM(total),0) AS revenue,
+             COALESCE(SUM(profit),0) AS profit
+      FROM operations
+      WHERE operation_type = 'Продажа'
+      ${seller.isEmpty ? '' : 'AND seller = ?'}
+      GROUP BY date(datetime(created_at, 'localtime'))
+      ORDER BY day DESC
+      LIMIT 90
+      ''',
+      args,
+    );
+  }
+
+  Future<List<Map<String, dynamic>>> ops(
+    String seller, {
+    String? productName,
+    String? operationType,
+  }) async {
+    final conditions = <String>[];
+    final args = <Object?>[];
+
+    if (seller.isNotEmpty) {
+      conditions.add('seller = ?');
+      args.add(seller);
+    }
+
+    if (productName != null && productName.isNotEmpty) {
+      conditions.add('product_name = ?');
+      args.add(productName);
+    }
+
+    if (operationType != null && operationType.isNotEmpty) {
+      conditions.add('operation_type = ?');
+      args.add(operationType);
     }
 
     return db!.query(
       'operations',
-      where: 'seller = ?',
-      whereArgs: [seller],
+      where: conditions.isEmpty ? null : conditions.join(' AND '),
+      whereArgs: conditions.isEmpty ? null : args,
       orderBy: 'id DESC',
       limit: 300,
     );
@@ -1099,11 +1308,12 @@ class _HomeState extends State<Home> {
               value: money(statistics['revenue'] ?? 0),
               icon: Icons.payments,
             ),
-            StatCard(
-              title: 'Прибыль',
-              value: money(statistics['profit'] ?? 0),
-              icon: Icons.trending_up,
-            ),
+            if (hasPermission(widget.user, 'profit'))
+              StatCard(
+                title: 'Прибыль',
+                value: money(statistics['profit'] ?? 0),
+                icon: Icons.trending_up,
+              ),
             StatCard(
               title: 'Продано',
               value:
@@ -1234,11 +1444,22 @@ class _ProductsState extends State<Products> {
   }
 
   Future<void> load() async {
-    final result = await DB.i.products(searchController.text);
+    final query = searchController.text.trim();
+    final result = await DB.i.products(query);
 
     if (!mounted) return;
 
-    setState(() => items = result);
+    // Товары с нулевым остатком не показываем в общем списке.
+    // При поиске по названию или штрихкоду они остаются доступны,
+    // чтобы администратор мог открыть товар и сделать пополнение.
+    final visible = query.isEmpty
+        ? result.where((product) {
+            final quantity = (product['quantity'] as num?)?.toInt() ?? 0;
+            return quantity > 0;
+          }).toList()
+        : result;
+
+    setState(() => items = visible);
   }
 
   Future<void> form([Map<String, dynamic>? product]) async {
@@ -1254,6 +1475,15 @@ class _ProductsState extends State<Products> {
 
   @override
   Widget build(BuildContext context) {
+    if (!hasPermission(widget.user, 'products_view')) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Товары')),
+        body: const Center(
+          child: Text('У вас нет доступа к товарам.'),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         leading: IconButton(
@@ -1268,7 +1498,7 @@ class _ProductsState extends State<Products> {
           ),
         ),
         actions: [
-          if (widget.user['role'] == 'admin')
+          if (hasPermission(widget.user, 'products_edit'))
             IconButton(
               onPressed: () => form(),
               icon: const Icon(Icons.add),
@@ -1340,8 +1570,7 @@ class _ProductsState extends State<Products> {
                             'Остаток: $quantity шт.',
                           ),
                           isThreeLine: true,
-                          trailing: widget.user['role'] ==
-                                  'admin'
+                          trailing: hasPermission(widget.user, 'products_edit')
                               ? TextButton(
                                   onPressed: () =>
                                       form(product),
@@ -1576,38 +1805,25 @@ class Sale extends StatefulWidget {
 
 class _SaleState extends State<Sale> {
   final barcodeController = TextEditingController();
+  final searchController = TextEditingController();
   final discountController =
       TextEditingController(text: '0');
 
+  String paymentMethod = 'Наличные';
+
   final cart = <CartItem>[];
+  List<Map<String, dynamic>> _searchResults = [];
 
   @override
   void dispose() {
     barcodeController.dispose();
+    searchController.dispose();
     discountController.dispose();
     super.dispose();
   }
 
-  Future<void> addByBarcode(String value) async {
-    final code = value.trim();
-
-    if (code.isEmpty) return;
-
-    final product = await DB.i.product(code);
-
-    if (!mounted) return;
-
-    if (product == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Товар не найден'),
-        ),
-      );
-      return;
-    }
-
-    final stock =
-        (product['quantity'] as num).toInt();
+  Future<void> addProductToCart(Map<String, dynamic> product) async {
+    final stock = (product['quantity'] as num).toInt();
 
     final existing = cart.where(
       (item) => item.id == product['id'],
@@ -1631,9 +1847,7 @@ class _SaleState extends State<Sale> {
     } else {
       if (stock <= 0) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Товара нет на складе'),
-          ),
+          const SnackBar(content: Text('Товара нет на складе')),
         );
         return;
       }
@@ -1644,18 +1858,48 @@ class _SaleState extends State<Sale> {
             id: product['id'] as int,
             code: product['barcode'].toString(),
             name: product['name'].toString(),
-            price:
-                (product['price'] as num).toDouble(),
-            buy:
-                (product['purchase_price'] as num?)
-                        ?.toDouble() ??
-                    0,
+            price: (product['price'] as num).toDouble(),
+            buy: (product['purchase_price'] as num?)?.toDouble() ?? 0,
           ),
         );
       });
     }
+  }
 
+  Future<void> addByBarcode(String value) async {
+    final code = value.trim();
+    if (code.isEmpty) return;
+
+    final product = await DB.i.product(code);
+
+    if (!mounted) return;
+
+    if (product == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Товар не найден')),
+      );
+      return;
+    }
+
+    await addProductToCart(product);
     barcodeController.clear();
+  }
+
+  Future<void> searchProducts(String value) async {
+    final query = value.trim();
+
+    if (query.isEmpty) {
+      if (mounted) setState(() {});
+      return;
+    }
+
+    final results = await DB.i.products(query);
+
+    if (!mounted || searchController.text.trim() != query) return;
+
+    setState(() {
+      _searchResults = results;
+    });
   }
 
   Future<void> scan() async {
@@ -1703,6 +1947,7 @@ class _SaleState extends State<Sale> {
         cart,
         discount,
         widget.user['username'].toString(),
+        paymentMethod,
       );
 
       if (!mounted) return;
@@ -1760,6 +2005,15 @@ class _SaleState extends State<Sale> {
 
   @override
   Widget build(BuildContext context) {
+    if (!hasPermission(widget.user, 'sell')) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Продажа')),
+        body: const Center(
+          child: Text('У вас нет права на продажи.'),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         leading: IconButton(
@@ -1782,11 +2036,11 @@ class _SaleState extends State<Sale> {
               children: [
                 Expanded(
                   child: TextField(
-                    controller: barcodeController,
-                    onSubmitted: addByBarcode,
+                    controller: searchController,
+                    onChanged: searchProducts,
                     decoration: const InputDecoration(
-                      prefixIcon: Icon(Icons.qr_code),
-                      hintText: 'Штрихкод',
+                      prefixIcon: Icon(Icons.search),
+                      hintText: 'Найти товар по названию',
                     ),
                   ),
                 ),
@@ -1800,6 +2054,62 @@ class _SaleState extends State<Sale> {
               ],
             ),
           ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: barcodeController,
+                    onSubmitted: addByBarcode,
+                    decoration: const InputDecoration(
+                      prefixIcon: Icon(Icons.qr_code),
+                      hintText: 'Штрихкод',
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (searchController.text.trim().isNotEmpty)
+            Container(
+              constraints: const BoxConstraints(maxHeight: 240),
+              margin: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+              decoration: BoxDecoration(
+                color: cardColor,
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: _searchResults.isEmpty
+                  ? const Padding(
+                      padding: EdgeInsets.all(16),
+                      child: Text('Товар не найден'),
+                    )
+                  : ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: _searchResults.length,
+                      itemBuilder: (context, index) {
+                        final product = _searchResults[index];
+                        final stock = (product['quantity'] as num).toInt();
+                        return ListTile(
+                          leading: const Icon(Icons.inventory_2_outlined),
+                          title: Text(product['name'].toString()),
+                          subtitle: Text(
+                            '${money((product['price'] as num).toDouble())} • Остаток: $stock',
+                          ),
+                          trailing: const Icon(Icons.add_circle_outline),
+                          enabled: stock > 0,
+                          onTap: stock <= 0
+                              ? null
+                              : () async {
+                                  await addProductToCart(product);
+                                  if (!mounted) return;
+                                  searchController.clear();
+                                  setState(() => _searchResults = []);
+                                },
+                        );
+                      },
+                    ),
+            ),
           Expanded(
             child: cart.isEmpty
                 ? const Center(
@@ -1934,6 +2244,33 @@ class _SaleState extends State<Sale> {
                         ),
                       ),
                     ],
+                  ),
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: Text(
+                      'Способ оплаты',
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  SegmentedButton<String>(
+                    segments: const [
+                      ButtonSegment(
+                        value: 'Наличные',
+                        label: Text('Наличные'),
+                        icon: Icon(Icons.payments_outlined),
+                      ),
+                      ButtonSegment(
+                        value: 'Карта',
+                        label: Text('Карта'),
+                        icon: Icon(Icons.credit_card),
+                      ),
+                    ],
+                    selected: {paymentMethod},
+                    onSelectionChanged: (value) {
+                      setState(() => paymentMethod = value.first);
+                    },
                   ),
                   const SizedBox(height: 8),
                   Row(
@@ -2109,6 +2446,17 @@ class _StatsState extends State<Stats> {
         child: ListView(
           padding: const EdgeInsets.all(12),
           children: [
+            if (!hasPermission(widget.user, 'stats'))
+              const Card(
+                child: Padding(
+                  padding: EdgeInsets.all(20),
+                  child: Text(
+                    'У вас нет доступа к статистике.',
+                    style: TextStyle(fontSize: 18),
+                  ),
+                ),
+              )
+            else ...[
             if (loading)
               const Padding(
                 padding: EdgeInsets.only(bottom: 12),
@@ -2135,11 +2483,12 @@ class _StatsState extends State<Stats> {
               value: money(statistics['revenue'] ?? 0),
               icon: Icons.payments,
             ),
-            StatCard(
-              title: 'Прибыль',
-              value: money(statistics['profit'] ?? 0),
-              icon: Icons.trending_up,
-            ),
+            if (hasPermission(widget.user, 'profit'))
+              StatCard(
+                title: 'Прибыль',
+                value: money(statistics['profit'] ?? 0),
+                icon: Icons.trending_up,
+              ),
             StatCard(
               title: 'Продано',
               value: '${(statistics['sold'] ?? 0).toInt()} шт.',
@@ -2154,6 +2503,33 @@ class _StatsState extends State<Stats> {
               title: 'Брак',
               value: '${(statistics['defects'] ?? 0).toInt()} шт.',
               icon: Icons.delete_outline,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Продажи по дням',
+              style: TextStyle(fontSize: 21, fontWeight: FontWeight.w900),
+            ),
+            const SizedBox(height: 8),
+            FutureBuilder<List<Map<String, dynamic>>>(
+              future: DB.i.dailySales(
+                widget.user['role'] == 'admin'
+                    ? ''
+                    : widget.user['username'].toString(),
+              ),
+              builder: (context, snapshot) {
+                if (!snapshot.hasData) return const LinearProgressIndicator();
+                final rows = snapshot.data!;
+                if (rows.isEmpty) return const Card(child: Padding(padding: EdgeInsets.all(16), child: Text('Продаж пока нет')));
+                return Column(
+                  children: rows.take(31).map((row) => Card(
+                    child: ListTile(
+                      title: Text(row['day'].toString(), style: const TextStyle(fontWeight: FontWeight.w800)),
+                      subtitle: Text('Продаж: ${row['sales']} • Товаров: ${row['sold']}'),
+                      trailing: Text(money((row['revenue'] as num?)?.toDouble() ?? 0)),
+                    ),
+                  )).toList(),
+                );
+              },
             ),
             if (widget.user['role'] == 'admin') ...[
               const SizedBox(height: 12),
@@ -2177,8 +2553,12 @@ class _StatsState extends State<Stats> {
                 )
               else
                 ...sellerStatistics.map(
-                  (row) => _SellerStatCard(row: row),
+                  (row) => _SellerStatCard(
+                    row: row,
+                    canSeeProfit: hasPermission(widget.user, 'profit'),
+                  ),
                 ),
+            ],
             ],
           ],
         ),
@@ -2189,9 +2569,11 @@ class _StatsState extends State<Stats> {
 
 class _SellerStatCard extends StatelessWidget {
   final Map<String, dynamic> row;
+  final bool canSeeProfit;
 
   const _SellerStatCard({
     required this.row,
+    required this.canSeeProfit,
   });
 
   @override
@@ -2251,12 +2633,13 @@ class _SellerStatCard extends StatelessWidget {
                     value: money(revenue),
                   ),
                 ),
-                Expanded(
-                  child: _MiniStat(
-                    label: 'Прибыль',
-                    value: money(profit),
+                if (canSeeProfit)
+                  Expanded(
+                    child: _MiniStat(
+                      label: 'Прибыль',
+                      value: money(profit),
+                    ),
                   ),
-                ),
               ],
             ),
           ],
@@ -2337,8 +2720,9 @@ class More extends StatelessWidget {
               ),
             ),
           ),
-          MoreAction(
-            title: 'Кассовая смена',
+          if (hasPermission(user, 'shift'))
+            MoreAction(
+              title: 'Кассовая смена',
             icon: Icons.point_of_sale,
             onTap: () {
               Navigator.push(
@@ -2349,8 +2733,9 @@ class More extends StatelessWidget {
               );
             },
           ),
-          MoreAction(
-            title: 'История операций',
+          if (hasPermission(user, 'history'))
+            MoreAction(
+              title: 'История операций',
             icon: Icons.receipt_long,
             onTap: () {
               Navigator.push(
@@ -2361,8 +2746,9 @@ class More extends StatelessWidget {
               );
             },
           ),
-          MoreAction(
-            title: 'Чеки',
+          if (hasPermission(user, 'receipts'))
+            MoreAction(
+              title: 'Чеки',
             icon: Icons.receipt,
             onTap: () {
               Navigator.push(
@@ -2373,8 +2759,35 @@ class More extends StatelessWidget {
               );
             },
           ),
-          MoreAction(
-            title: 'Возврат',
+          if (hasPermission(user, 'purchases'))
+            MoreAction(
+              title: 'Дополнительная закупка',
+              icon: Icons.add_box,
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => PurchasePage(user: user),
+                  ),
+                );
+              },
+            ),
+          if (hasPermission(user, 'product_history'))
+            MoreAction(
+              title: 'История товара',
+              icon: Icons.history,
+              onTap: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ProductHistoryPage(user: user),
+                  ),
+                );
+              },
+            ),
+          if (hasPermission(user, 'returns'))
+            MoreAction(
+              title: 'Возврат',
             icon: Icons.undo,
             onTap: () {
               Navigator.push(
@@ -2388,8 +2801,9 @@ class More extends StatelessWidget {
               );
             },
           ),
-          MoreAction(
-            title: 'Списать брак',
+          if (hasPermission(user, 'defects'))
+            MoreAction(
+              title: 'Списать брак',
             icon: Icons.delete_outline,
             onTap: () {
               Navigator.push(
@@ -2416,8 +2830,9 @@ class More extends StatelessWidget {
                 );
               },
             ),
-          MoreAction(
-            title: 'Резервная копия',
+          if (hasPermission(user, 'backup'))
+            MoreAction(
+              title: 'Резервная копия',
             icon: Icons.backup,
             onTap: () async {
               await DB.i.backup();
@@ -2576,6 +2991,15 @@ class _ShiftPageState extends State<ShiftPage> {
 
   @override
   Widget build(BuildContext context) {
+    if (!hasPermission(widget.user, 'shift')) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Кассовая смена')),
+        body: const Center(
+          child: Text('У вас нет права на кассовую смену.'),
+        ),
+      );
+    }
+
     if (loading) {
       return Scaffold(
         appBar: AppBar(title: const Text('Кассовая смена')),
@@ -2762,6 +3186,15 @@ class _ReceiptsState extends State<Receipts> {
 
   @override
   Widget build(BuildContext context) {
+    if (!hasPermission(widget.user, 'receipts')) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Чеки')),
+        body: const Center(
+          child: Text('У вас нет доступа к чекам.'),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('Чеки'),
@@ -2836,7 +3269,8 @@ class _ReceiptsState extends State<Receipts> {
                       ),
                     ),
                     subtitle: Text(
-                      '${seller.isEmpty ? 'Продавец не указан' : seller}\n'
+                      '${seller.isEmpty ? 'Продавец не указан' : seller} • '
+                      '${receipt['payment_method'] ?? 'Наличные'}\n'
                       '${formatDateTime(created)}',
                     ),
                     isThreeLine: true,
@@ -2979,6 +3413,10 @@ class _ReceiptDetailState extends State<ReceiptDetail> {
                       Text(
                         'Продавец: ${receipt['seller'] ?? ''}',
                       ),
+                      const SizedBox(height: 4),
+                      Text(
+                        'Оплата: ${receipt['payment_method'] ?? 'Наличные'}',
+                      ),
                     ],
                   ),
                 ),
@@ -3099,28 +3537,51 @@ class History extends StatefulWidget {
 class _HistoryState extends State<History> {
   late Future<List<Map<String, dynamic>>> future;
 
+  String selectedProduct = 'Все товары';
+  String selectedType = 'Все операции';
+
+  String get seller => widget.user['role'] == 'admin'
+      ? ''
+      : widget.user['username'].toString();
+
   @override
   void initState() {
     super.initState();
-    future = DB.i.ops(
-      widget.user['role'] == 'admin'
-          ? ''
-          : widget.user['username'].toString(),
-    );
+    future = DB.i.ops(seller);
+  }
+
+  void reload() {
+    setState(() {
+      future = DB.i.ops(seller);
+    });
   }
 
   @override
   Widget build(BuildContext context) {
+    if (!hasPermission(widget.user, 'history')) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('История операций')),
+        body: const Center(
+          child: Text('У вас нет доступа к истории операций.'),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('История'),
+        actions: [
+          IconButton(
+            tooltip: 'Обновить',
+            onPressed: reload,
+            icon: const Icon(Icons.refresh),
+          ),
+        ],
       ),
-      body: FutureBuilder<
-          List<Map<String, dynamic>>>(
+      body: FutureBuilder<List<Map<String, dynamic>>>(
         future: future,
         builder: (context, snapshot) {
-          if (snapshot.connectionState !=
-              ConnectionState.done) {
+          if (snapshot.connectionState != ConnectionState.done) {
             return const Center(
               child: CircularProgressIndicator(),
             );
@@ -3128,15 +3589,13 @@ class _HistoryState extends State<History> {
 
           if (snapshot.hasError) {
             return Center(
-              child: Text(
-                'Ошибка: ${snapshot.error}',
-              ),
+              child: Text('Ошибка: ${snapshot.error}'),
             );
           }
 
-          final items = snapshot.data ?? [];
+          final allItems = snapshot.data ?? [];
 
-          if (items.isEmpty) {
+          if (allItems.isEmpty) {
             return const Center(
               child: Text(
                 'Операций пока нет',
@@ -3147,48 +3606,178 @@ class _HistoryState extends State<History> {
             );
           }
 
-          return ListView.builder(
-            padding: const EdgeInsets.all(12),
-            itemCount: items.length,
-            itemBuilder: (_, index) {
-              final item = items[index];
-              final type =
-                  item['operation_type'].toString();
-
-              final icon = type == 'Продажа'
-                  ? Icons.shopping_cart
-                  : type == 'Возврат'
-                      ? Icons.undo
-                      : Icons.delete_outline;
-
-              return Card(
-                child: ListTile(
-                  leading: CircleAvatar(
-                    backgroundColor:
-                        const Color(0xff4f3b86),
-                    child: Icon(icon),
+          final products = allItems
+              .map((item) => item['product_name']?.toString() ?? '')
+              .where((name) => name.isNotEmpty)
+              .toSet()
+              .toList()
+            ..sort(
+              (a, b) => a.toLowerCase().compareTo(
+                    b.toLowerCase(),
                   ),
-                  title: Text(
-                    '${item['product_name']} × '
-                    '${item['quantity']}',
-                    style: const TextStyle(
-                      fontWeight: FontWeight.w800,
+            );
+
+          final filteredItems = allItems.where((item) {
+            final productMatches = selectedProduct == 'Все товары' ||
+                item['product_name']?.toString() == selectedProduct;
+
+            final typeMatches = selectedType == 'Все операции' ||
+                item['operation_type']?.toString() == selectedType;
+
+            return productMatches && typeMatches;
+          }).toList();
+
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: DropdownButtonFormField<String>(
+                        initialValue: selectedType,
+                        decoration: const InputDecoration(
+                          labelText: 'Операция',
+                          prefixIcon: Icon(Icons.filter_list),
+                        ),
+                        items: const [
+                          DropdownMenuItem(
+                            value: 'Все операции',
+                            child: Text('Все операции'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'Продажа',
+                            child: Text('Только продажи'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'Возврат',
+                            child: Text('Только возвраты'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'Брак',
+                            child: Text('Только брак'),
+                          ),
+                          DropdownMenuItem(
+                            value: 'Закупка',
+                            child: Text('Только закупки'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value == null) return;
+                          setState(() => selectedType = value);
+                        },
+                      ),
                     ),
-                  ),
-                  subtitle: Text(
-                    '$type • '
-                    '${item['seller'] ?? ''}\n'
-                    '${formatDateTime(item['created_at'])}',
-                  ),
-                  isThreeLine: true,
-                  trailing: Text(
-                    money(
-                      (item['total'] as num?) ?? 0,
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: DropdownButtonFormField<String>(
+                        initialValue: selectedProduct,
+                        decoration: const InputDecoration(
+                          labelText: 'Товар',
+                          prefixIcon: Icon(Icons.inventory_2_outlined),
+                        ),
+                        isExpanded: true,
+                        items: [
+                          const DropdownMenuItem(
+                            value: 'Все товары',
+                            child: Text('Все товары'),
+                          ),
+                          ...products.map(
+                            (name) => DropdownMenuItem(
+                              value: name,
+                              child: Text(
+                                name,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value == null) return;
+                          setState(() => selectedProduct = value);
+                        },
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+                child: Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text(
+                    'Найдено: ${filteredItems.length}',
+                    style: const TextStyle(
+                      color: Colors.white60,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ),
-              );
-            },
+              ),
+              Expanded(
+                child: filteredItems.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'По выбранному фильтру ничего нет',
+                          style: TextStyle(
+                            color: Colors.white54,
+                          ),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.fromLTRB(
+                          12,
+                          0,
+                          12,
+                          12,
+                        ),
+                        itemCount: filteredItems.length,
+                        itemBuilder: (_, index) {
+                          final item = filteredItems[index];
+                          final type =
+                              item['operation_type'].toString();
+
+                          final icon = type == 'Продажа'
+                              ? Icons.shopping_cart
+                              : type == 'Возврат'
+                                  ? Icons.undo
+                                  : type == 'Закупка'
+                                      ? Icons.add_box
+                                      : Icons.delete_outline;
+
+                          return Card(
+                            child: ListTile(
+                              leading: CircleAvatar(
+                                backgroundColor:
+                                    const Color(0xff4f3b86),
+                                child: Icon(icon),
+                              ),
+                              title: Text(
+                                '${item['product_name']} × '
+                                '${item['quantity']}',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              subtitle: Text(
+                                '$type • ${item['seller'] ?? ''} • '
+                                '${item['payment_method'] ?? 'Наличные'}\n'
+                                '${formatDateTime(item['created_at'])}',
+                              ),
+                              isThreeLine: true,
+                              trailing: hasPermission(widget.user, 'profit')
+                                  ? Text(
+                                      type == 'Закупка'
+                                          ? money((item['cost'] as num?) ?? 0)
+                                          : money((item['total'] as num?) ?? 0),
+                                    )
+                                  : null,
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
           );
         },
       ),
@@ -3212,6 +3801,8 @@ class StockPage extends StatefulWidget {
 
 class _StockState extends State<StockPage> {
   final barcodeController = TextEditingController();
+  final searchController = TextEditingController();
+  List<Map<String, dynamic>> searchResults = [];
 
   Map<String, dynamic>? product;
   int quantity = 1;
@@ -3219,25 +3810,44 @@ class _StockState extends State<StockPage> {
   @override
   void dispose() {
     barcodeController.dispose();
+    searchController.dispose();
     super.dispose();
   }
 
   Future<void> findProduct() async {
-    final result = await DB.i.product(
-      barcodeController.text,
-    );
-
+    final text = barcodeController.text.trim();
+    if (text.isEmpty) return;
+    final result = await DB.i.product(text);
     if (!mounted) return;
-
-    setState(() => product = result);
-
+    setState(() {
+      product = result;
+      searchResults = [];
+    });
     if (result == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Товар не найден'),
-        ),
+        const SnackBar(content: Text('Товар не найден')),
       );
     }
+  }
+
+  Future<void> searchProducts(String value) async {
+    final q = value.trim();
+    if (q.isEmpty) {
+      if (mounted) setState(() => searchResults = []);
+      return;
+    }
+    final results = await DB.i.products(q);
+    if (!mounted || searchController.text.trim() != q) return;
+    setState(() => searchResults = results);
+  }
+
+  void selectProduct(Map<String, dynamic> value) {
+    setState(() {
+      product = value;
+      searchResults = [];
+    });
+    searchController.clear();
+    barcodeController.text = value['barcode'].toString();
   }
 
   Future<void> save() async {
@@ -3284,6 +3894,19 @@ class _StockState extends State<StockPage> {
 
   @override
   Widget build(BuildContext context) {
+    final allowed = widget.type == 'Брак'
+        ? hasPermission(widget.user, 'defects')
+        : hasPermission(widget.user, 'returns');
+
+    if (!allowed) {
+      return Scaffold(
+        appBar: AppBar(title: Text(widget.type)),
+        body: const Center(
+          child: Text('У вас нет права на эту операцию.'),
+        ),
+      );
+    }
+
     final stock = product == null
         ? 0
         : (product!['quantity'] as num).toInt();
@@ -3296,6 +3919,38 @@ class _StockState extends State<StockPage> {
         padding: const EdgeInsets.all(20),
         child: Column(
           children: [
+            TextField(
+              controller: searchController,
+              onChanged: searchProducts,
+              decoration: const InputDecoration(
+                labelText: 'Поиск по названию или штрихкоду',
+                prefixIcon: Icon(Icons.search),
+              ),
+            ),
+            if (searchResults.isNotEmpty)
+              Container(
+                constraints: const BoxConstraints(maxHeight: 220),
+                margin: const EdgeInsets.only(top: 8),
+                decoration: BoxDecoration(
+                  color: cardColor,
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: ListView.builder(
+                  shrinkWrap: true,
+                  itemCount: searchResults.length,
+                  itemBuilder: (_, index) {
+                    final item = searchResults[index];
+                    return ListTile(
+                      title: Text(item['name'].toString()),
+                      subtitle: Text(
+                        '${item['barcode']} • Остаток: ${item['quantity']}',
+                      ),
+                      onTap: () => selectProduct(item),
+                    );
+                  },
+                ),
+              ),
+            const SizedBox(height: 10),
             TextField(
               controller: barcodeController,
               onSubmitted: (_) => findProduct(),
@@ -3381,6 +4036,164 @@ class _StockState extends State<StockPage> {
             ],
           ],
         ),
+      ),
+    );
+  }
+}
+
+
+class PurchasePage extends StatefulWidget {
+  final Map<String, dynamic> user;
+  const PurchasePage({super.key, required this.user});
+  @override
+  State<PurchasePage> createState() => _PurchasePageState();
+}
+
+class _PurchasePageState extends State<PurchasePage> {
+  final search = TextEditingController();
+  final qty = TextEditingController(text: '1');
+  final buy = TextEditingController();
+  List<Map<String, dynamic>> results = [];
+  Map<String, dynamic>? product;
+
+  @override
+  void dispose() {
+    search.dispose(); qty.dispose(); buy.dispose(); super.dispose();
+  }
+
+  Future<void> find(String value) async {
+    final q = value.trim();
+    if (q.isEmpty) { if (mounted) setState(() => results = []); return; }
+    final r = await DB.i.products(q);
+    if (!mounted || search.text.trim() != q) return;
+    setState(() => results = r);
+  }
+
+  void select(Map<String, dynamic> p) {
+    setState(() { product = p; results = []; });
+    search.text = p['name'].toString();
+    buy.text = ((p['purchase_price'] as num?)?.toDouble() ?? 0).toString();
+  }
+
+  Future<void> save() async {
+    final p = product;
+    if (p == null) return;
+    final count = int.tryParse(qty.text.trim()) ?? 0;
+    final price = double.tryParse(buy.text.replaceAll(',', '.')) ?? -1;
+    if (count <= 0 || price < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Проверьте количество и закупочную цену')));
+      return;
+    }
+    try {
+      await DB.i.purchase(p['id'] as int, count, price, widget.user['username'].toString());
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Закупка добавлена')));
+      Navigator.pop(context);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!hasPermission(widget.user, 'purchases')) {
+      return Scaffold(appBar: AppBar(title: const Text('Закупка')), body: const Center(child: Text('У вас нет права на закупки.')));
+    }
+    return Scaffold(
+      appBar: AppBar(title: const Text('Дополнительная закупка')),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          TextField(controller: search, onChanged: find, decoration: const InputDecoration(labelText: 'Товар: название или штрихкод', prefixIcon: Icon(Icons.search))),
+          if (results.isNotEmpty)
+            Card(child: Column(children: results.map((p) => ListTile(title: Text(p['name'].toString()), subtitle: Text('${p['barcode']} • Остаток: ${p['quantity']}'), onTap: () => select(p))).toList())),
+          if (product != null) ...[
+            const SizedBox(height: 12),
+            Card(child: ListTile(title: Text(product!['name'].toString()), subtitle: Text('Текущий остаток: ${product!['quantity']} шт.'))),
+            const SizedBox(height: 12),
+            TextField(controller: qty, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'Количество', prefixIcon: Icon(Icons.add_box))),
+            const SizedBox(height: 10),
+            TextField(controller: buy, keyboardType: const TextInputType.numberWithOptions(decimal: true), decoration: const InputDecoration(labelText: 'Закупочная цена за 1 шт.', prefixIcon: Icon(Icons.shopping_cart))),
+            const SizedBox(height: 16),
+            FilledButton(onPressed: save, style: FilledButton.styleFrom(minimumSize: const Size.fromHeight(52)), child: const Text('Добавить закупку')),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class ProductHistoryPage extends StatefulWidget {
+  final Map<String, dynamic> user;
+  const ProductHistoryPage({super.key, required this.user});
+  @override
+  State<ProductHistoryPage> createState() => _ProductHistoryPageState();
+}
+
+class _ProductHistoryPageState extends State<ProductHistoryPage> {
+  final search = TextEditingController();
+  List<Map<String, dynamic>> results = [];
+  Map<String, dynamic>? product;
+  List<Map<String, dynamic>> history = [];
+
+  @override
+  void dispose() { search.dispose(); super.dispose(); }
+
+  Future<void> find(String value) async {
+    final q = value.trim();
+    if (q.isEmpty) { if (mounted) setState(() => results = []); return; }
+    final r = await DB.i.products(q);
+    if (!mounted || search.text.trim() != q) return;
+    setState(() => results = r);
+  }
+
+  Future<void> select(Map<String, dynamic> p) async {
+    final seller = widget.user['role'] == 'admin' ? '' : widget.user['username'].toString();
+    final h = await DB.i.productHistory(p['id'] as int, seller);
+    if (!mounted) return;
+    setState(() { product = p; results = []; history = h; });
+    search.text = p['name'].toString();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!hasPermission(widget.user, 'product_history')) {
+      return Scaffold(appBar: AppBar(title: const Text('История товара')), body: const Center(child: Text('У вас нет доступа к истории товара.')));
+    }
+    final canProfit = hasPermission(widget.user, 'profit');
+    return Scaffold(
+      appBar: AppBar(title: const Text('История товара')),
+      body: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          TextField(controller: search, onChanged: find, decoration: const InputDecoration(labelText: 'Название или штрихкод', prefixIcon: Icon(Icons.search))),
+          if (results.isNotEmpty)
+            Card(child: Column(children: results.map((p) => ListTile(title: Text(p['name'].toString()), subtitle: Text('${p['barcode']} • Остаток: ${p['quantity']}'), onTap: () => select(p))).toList())),
+          if (product != null) ...[
+            const SizedBox(height: 10),
+            Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(product!['name'].toString(), style: const TextStyle(fontSize: 21, fontWeight: FontWeight.w900)),
+              const SizedBox(height: 6),
+              Text('Остаток: ${product!['quantity']} шт.'),
+              if (canProfit) Text('Текущая закупочная цена: ${money((product!['purchase_price'] as num?)?.toDouble() ?? 0)}'),
+            ]))),
+            const SizedBox(height: 8),
+            Text('Движение товара', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.w900)),
+            if (history.isEmpty) const Padding(padding: EdgeInsets.all(20), child: Text('Истории пока нет')),
+            ...history.map((item) {
+              final type = item['operation_type'].toString();
+              final qty = (item['quantity'] as num?)?.toInt() ?? 0;
+              final cost = (item['cost'] as num?)?.toDouble() ?? 0;
+              return Card(child: ListTile(
+                title: Text('$type • $qty шт.', style: const TextStyle(fontWeight: FontWeight.w800)),
+                subtitle: Text('${formatDateTime(item['created_at'])}\nПродавец: ${item['seller'] ?? ''}'),
+                isThreeLine: true,
+                trailing: canProfit && type == 'Закупка' ? Text(money(cost)) : null,
+              ));
+            }),
+          ],
+        ],
       ),
     );
   }
@@ -3490,6 +4303,7 @@ class _UserFormState extends State<UserForm> {
   late final TextEditingController password;
 
   bool active = true;
+  late Map<String, bool> permissions;
 
   @override
   void initState() {
@@ -3506,6 +4320,9 @@ class _UserFormState extends State<UserForm> {
     active = widget.user == null
         ? true
         : widget.user!['active'] != 0;
+    permissions = widget.user == null
+        ? <String, bool>{...sellerPermissionDefaults}
+        : decodePermissions(widget.user!['permissions']);
   }
 
   @override
@@ -3553,10 +4370,14 @@ class _UserFormState extends State<UserForm> {
       data['password_hash'] =
           hashPassword(password.text);
       data['role'] = 'seller';
+      data['permissions'] = jsonEncode(permissions);
       data['created_at'] =
           DateTime.now().toIso8601String();
     } else {
       data['id'] = widget.user!['id'];
+      if (widget.user!['role']?.toString() != 'admin') {
+        data['permissions'] = jsonEncode(permissions);
+      }
 
       if (password.text.isNotEmpty) {
         data['password_hash'] =
@@ -3638,6 +4459,31 @@ class _UserFormState extends State<UserForm> {
               },
               title: const Text('Активен'),
             ),
+            if (widget.user?['role']?.toString() != 'admin') ...[
+              const Align(
+                alignment: Alignment.centerLeft,
+                child: Padding(
+                  padding: EdgeInsets.only(top: 8, bottom: 4),
+                  child: Text(
+                    'Права доступа',
+                    style: TextStyle(
+                      fontSize: 19,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+              ),
+              ...permissionLabels.entries.map(
+                (entry) => SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: permissions[entry.key] ?? false,
+                  onChanged: (value) {
+                    setState(() => permissions[entry.key] = value);
+                  },
+                  title: Text(entry.value),
+                ),
+              ),
+            ],
             FilledButton(
               onPressed: save,
               style: FilledButton.styleFrom(
