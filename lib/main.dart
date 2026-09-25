@@ -1,14 +1,18 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:path/path.dart' as p;
 import 'package:sqflite/sqflite.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+import 'supabase_config.dart';
 
 const primary = Color(0xff9b7bff);
 const background = Color(0xff090a0f);
@@ -26,9 +30,13 @@ String money(num value) => '${value.toStringAsFixed(2)} ₽';
 String formatDateTime(Object? value) {
   final raw = value?.toString() ?? '';
   final date = DateTime.tryParse(raw);
-  if (date == null) return raw;
 
-  final local = date.toLocal();
+  if (date == null) {
+    return raw;
+  }
+
+  final local = date.isUtc ? date.toLocal() : date;
+
   String two(int n) => n.toString().padLeft(2, '0');
 
   return '${two(local.day)}.${two(local.month)}.${local.year} • '
@@ -73,29 +81,47 @@ const permissionLabels = <String, String>{
 
 Map<String, bool> decodePermissions(Object? raw) {
   final result = <String, bool>{...sellerPermissionDefaults};
-  if (raw is String && raw.trim().isNotEmpty) {
+
+  Map<dynamic, dynamic>? decoded;
+
+  if (raw is Map) {
+    // Supabase JSONB приходит в Flutter как Map.
+    decoded = raw;
+  } else if (raw is String && raw.trim().isNotEmpty) {
     try {
-      final decoded = jsonDecode(raw);
-      if (decoded is Map) {
-        for (final key in sellerPermissionDefaults.keys) {
-          if (decoded[key] is bool) {
-            result[key] = decoded[key] as bool;
-          }
-        }
+      final value = jsonDecode(raw);
+      if (value is Map) {
+        decoded = value;
       }
     } catch (_) {}
   }
+
+  if (decoded != null) {
+    for (final key in sellerPermissionDefaults.keys) {
+      final value = decoded[key];
+      if (value is bool) {
+        result[key] = value;
+      }
+    }
+  }
+
   return result;
 }
-
 bool hasPermission(Map<String, dynamic> user, String permission) {
   if (user['role']?.toString() == 'admin') return true;
   return decodePermissions(user['permissions'])[permission] ?? false;
 }
 
-void main() async {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
   await DB.i.open();
+
+  await Supabase.initialize(
+    url: supabaseUrl,
+    publishableKey: supabasePublishableKey,
+  );
+
   runApp(const App());
 }
 
@@ -126,6 +152,14 @@ class DB {
       'products',
       'purchase_price',
       'REAL DEFAULT 0',
+    );
+    // ID товара на сервере Supabase. Локальный id сохраняем для совместимости
+    // с текущими продажами, пока продажи не перенесены на сервер.
+    await _ensureColumn(
+      database,
+      'products',
+      'server_id',
+      'INTEGER',
     );
     await _ensureColumn(
       database,
@@ -294,42 +328,174 @@ class DB {
   }
 
   Future<Map<String, dynamic>?> login(
-    String username,
-    String password,
-  ) async {
-    final rows = await db!.query(
-      'users',
-      where: 'username = ? AND password_hash = ? AND active = 1',
-      whereArgs: [username.trim(), hashPassword(password)],
-      limit: 1,
+  String email,
+  String password,
+) async {
+  try {
+    // Вход через Supabase Auth
+    final response = await Supabase.instance.client.auth
+        .signInWithPassword(
+      email: email.trim(),
+      password: password,
     );
 
-    return rows.isEmpty ? null : rows.first;
+    final authUser = response.user;
+
+    if (authUser == null) {
+      return null;
+    }
+
+    // Получаем профиль пользователя из нашей таблицы users
+    final profile = await Supabase.instance.client
+        .from('users')
+        .select()
+        .eq('auth_user_id', authUser.id)
+        .eq('active', true)
+        .maybeSingle();
+
+    if (profile == null) {
+      await Supabase.instance.client.auth.signOut();
+      return null;
+    }
+
+    final result = Map<String, dynamic>.from(profile);
+    print('LOGIN PROFILE: ${result['username']} permissions=${result['permissions']}');
+    return result;
+  } catch (e) {
+    print('LOGIN ERROR: $e');
+    return null;
+  }
+  }
+
+
+
+  // =========================
+  // ТОВАРЫ: SUPABASE + ЛОКАЛЬНЫЙ КЭШ
+  // =========================
+
+  Future<List<Map<String, dynamic>>> serverProducts() async {
+    final data = await Supabase.instance.client
+        .from('products')
+        .select()
+        .order('name');
+
+    return List<Map<String, dynamic>>.from(
+      data.map((row) => Map<String, dynamic>.from(row)),
+    );
+  }
+
+  Future<void> cacheServerProducts(
+    List<Map<String, dynamic>> serverRows,
+  ) async {
+    for (final serverProduct in serverRows) {
+      final barcode = serverProduct['barcode']?.toString().trim() ?? '';
+      if (barcode.isEmpty) continue;
+
+      final localRows = await db!.query(
+        'products',
+        where: 'barcode = ?',
+        whereArgs: [barcode],
+        limit: 1,
+      );
+
+      final localData = <String, dynamic>{
+        'barcode': barcode,
+        'name': serverProduct['name']?.toString() ?? '',
+        'price': (serverProduct['price'] as num?)?.toDouble() ?? 0,
+        'quantity': (serverProduct['quantity'] as num?)?.toInt() ?? 0,
+        'purchase_price':
+            (serverProduct['purchase_price'] as num?)?.toDouble() ?? 0,
+        'server_id': (serverProduct['id'] as num?)?.toInt(),
+      };
+
+      if (localRows.isEmpty) {
+        await db!.insert('products', localData);
+      } else {
+        await db!.update(
+          'products',
+          localData,
+          where: 'id = ?',
+          whereArgs: [localRows.first['id']],
+        );
+      }
+    }
   }
 
   Future<List<Map<String, dynamic>>> products([String query = '']) async {
-    if (query.trim().isEmpty) {
+    try {
+      final serverRows = await serverProducts();
+      await cacheServerProducts(serverRows);
+
+      final q = query.trim().toLowerCase();
+      final filtered = q.isEmpty
+          ? serverRows
+          : serverRows.where((product) {
+              final name =
+                  product['name']?.toString().toLowerCase() ?? '';
+              final barcode =
+                  product['barcode']?.toString().toLowerCase() ?? '';
+              return name.contains(q) || barcode.contains(q);
+            }).toList();
+
+      // Возвращаем локальные строки, чтобы старый модуль продаж продолжал
+      // работать с локальным id. У серверного товара есть server_id.
+      final result = <Map<String, dynamic>>[];
+      for (final serverProduct in filtered) {
+        final barcode = serverProduct['barcode']?.toString() ?? '';
+        final localRows = await db!.query(
+          'products',
+          where: 'barcode = ?',
+          whereArgs: [barcode],
+          limit: 1,
+        );
+        if (localRows.isNotEmpty) {
+          result.add(localRows.first);
+        }
+      }
+      return result;
+    } catch (e) {
+      print('SERVER PRODUCTS ERROR: $e');
+
+      if (query.trim().isEmpty) {
+        return db!.query(
+          'products',
+          where: 'server_id IS NOT NULL',
+          orderBy: 'name COLLATE NOCASE',
+        );
+      }
+
+      final q = query.trim();
       return db!.query(
         'products',
+        where: '(name LIKE ? OR barcode LIKE ?) AND server_id IS NOT NULL',
+        whereArgs: ['%$q%', '%$q%'],
         orderBy: 'name COLLATE NOCASE',
       );
     }
-
-    final q = query.trim();
-
-    return db!.query(
-      'products',
-      where: 'name LIKE ? OR barcode LIKE ?',
-      whereArgs: ['%$q%', '%$q%'],
-      orderBy: 'name COLLATE NOCASE',
-    );
   }
 
   Future<Map<String, dynamic>?> product(String barcode) async {
+    final code = barcode.trim();
+    if (code.isEmpty) return null;
+
+    try {
+      final data = await Supabase.instance.client
+          .from('products')
+          .select()
+          .eq('barcode', code)
+          .maybeSingle();
+
+      if (data != null) {
+        await cacheServerProducts([Map<String, dynamic>.from(data)]);
+      }
+    } catch (e) {
+      print('SERVER PRODUCT ERROR: $e');
+    }
+
     final rows = await db!.query(
       'products',
-      where: 'barcode = ?',
-      whereArgs: [barcode.trim()],
+      where: 'barcode = ? AND server_id IS NOT NULL',
+      whereArgs: [code],
       limit: 1,
     );
 
@@ -337,14 +503,75 @@ class DB {
   }
 
   Future<void> saveProduct(Map<String, dynamic> product) async {
-    if (product['id'] == null) {
-      await db!.insert('products', product);
+    final barcode = product['barcode']?.toString().trim() ?? '';
+    if (barcode.isEmpty) {
+      throw Exception('Штрихкод не может быть пустым');
+    }
+
+    final data = <String, dynamic>{
+      'barcode': barcode,
+      'name': product['name']?.toString().trim() ?? '',
+      'price': (product['price'] as num?)?.toDouble() ?? 0,
+      'quantity': (product['quantity'] as num?)?.toInt() ?? 0,
+      'purchase_price':
+          (product['purchase_price'] as num?)?.toDouble() ?? 0,
+    };
+
+    final serverId = (product['server_id'] as num?)?.toInt();
+    final localId = (product['id'] as num?)?.toInt();
+
+    Map<String, dynamic>? savedServerProduct;
+
+    if (serverId == null) {
+      savedServerProduct = Map<String, dynamic>.from(
+        await Supabase.instance.client
+            .from('products')
+            .insert(data)
+            .select()
+            .single(),
+      );
+    } else {
+      savedServerProduct = Map<String, dynamic>.from(
+        await Supabase.instance.client
+            .from('products')
+            .update(data)
+            .eq('id', serverId)
+            .select()
+            .single(),
+      );
+    }
+
+    final savedServerId =
+        (savedServerProduct['id'] as num?)?.toInt();
+    final localData = <String, dynamic>{
+      ...data,
+      'server_id': savedServerId,
+    };
+
+    if (localId == null) {
+      final existing = await db!.query(
+        'products',
+        where: 'barcode = ?',
+        whereArgs: [barcode],
+        limit: 1,
+      );
+
+      if (existing.isEmpty) {
+        await db!.insert('products', localData);
+      } else {
+        await db!.update(
+          'products',
+          localData,
+          where: 'id = ?',
+          whereArgs: [existing.first['id']],
+        );
+      }
     } else {
       await db!.update(
         'products',
-        product,
+        localData,
         where: 'id = ?',
-        whereArgs: [product['id']],
+        whereArgs: [localId],
       );
     }
   }
@@ -390,116 +617,126 @@ class DB {
   ) async {
     if (cart.isEmpty) return 0;
 
-    if (await currentShift() == null) {
-      throw Exception('Смена не открыта. Сначала откройте смену.');
+    final subtotal = cart.fold<double>(
+      0,
+      (sum, item) => sum + item.total,
+    );
+    final discountAmount = subtotal * discount / 100;
+    final receiptTotal = subtotal - discountAmount;
+
+    final items = cart.map((item) => {
+      'barcode': item.code,
+      'quantity': item.qty,
+    }).toList();
+
+    final response = await Supabase.instance.client.rpc(
+      'process_sale',
+      params: {
+        'p_items': items,
+        'p_subtotal': subtotal,
+        'p_discount': discountAmount,
+        'p_total': receiptTotal,
+        'p_payment_method': paymentMethod,
+        'p_seller_name': seller,
+      },
+    );
+
+    if (response is Map) {
+      final data = Map<String, dynamic>.from(response);
+      final receiptId = (data['receipt_id'] as num?)?.toInt();
+      if (receiptId != null) {
+        // Сервер уже изменил остаток и создал чек атомарно.
+        // Обновляем локальный кэш только после успешного ответа сервера.
+        await _syncSoldProductsToLocalCache(cart);
+        notifyInventoryChanged();
+        return receiptId;
+      }
     }
 
-    return await db!.transaction<int>((transaction) async {
-      final subtotal = cart.fold<double>(
-        0,
-        (sum, item) => sum + item.total,
-      );
+    throw Exception('Сервер не вернул номер чека');
+  }
 
-      final discountAmount = subtotal * discount / 100;
-      final receiptTotal = subtotal - discountAmount;
+  Future<void> _syncSoldProductsToLocalCache(List<CartItem> cart) async {
+    for (final item in cart) {
+      try {
+        final serverProduct = await Supabase.instance.client
+            .from('products')
+            .select()
+            .eq('barcode', item.code)
+            .maybeSingle();
 
-      final receiptId = await transaction.insert('receipts', {
-        'seller': seller,
-        'subtotal': subtotal,
-        'discount': discountAmount,
-        'total': receiptTotal,
-        'payment_method': paymentMethod,
-        'created_at': DateTime.now().toIso8601String(),
-      });
+        if (serverProduct == null) continue;
 
-      for (final item in cart) {
-        final rows = await transaction.query(
+        final serverId = (serverProduct['id'] as num?)?.toInt();
+        final existing = await db!.query(
           'products',
-          where: 'id = ?',
-          whereArgs: [item.id],
+          where: 'barcode = ?',
+          whereArgs: [item.code],
           limit: 1,
         );
 
-        if (rows.isEmpty) {
-          throw Exception('Товар не найден: ${item.name}');
+        final localData = {
+          'barcode': serverProduct['barcode'],
+          'name': serverProduct['name'],
+          'price': (serverProduct['price'] as num?)?.toDouble() ?? 0,
+          'quantity': (serverProduct['quantity'] as num?)?.toInt() ?? 0,
+          'purchase_price':
+              (serverProduct['purchase_price'] as num?)?.toDouble() ?? 0,
+          'server_id': serverId,
+        };
+
+        if (existing.isEmpty) {
+          await db!.insert('products', localData);
+        } else {
+          await db!.update(
+            'products',
+            localData,
+            where: 'id = ?',
+            whereArgs: [existing.first['id']],
+          );
         }
-
-        final product = rows.first;
-        final stock = (product['quantity'] as num).toInt();
-
-        if (item.qty > stock) {
-          throw Exception('Недостаточно товара: ${item.name}');
-        }
-
-        final itemTotal = item.total * (1 - discount / 100);
-        final cost = item.buy * item.qty;
-        final profit = itemTotal - cost;
-        final itemDiscount = item.total - itemTotal;
-
-        await transaction.update(
-          'products',
-          {'quantity': stock - item.qty},
-          where: 'id = ?',
-          whereArgs: [item.id],
-        );
-
-        await transaction.insert('receipt_items', {
-          'receipt_id': receiptId,
-          'barcode': item.code,
-          'product_name': item.name,
-          'quantity': item.qty,
-          'price': item.price,
-          'purchase_price': item.buy,
-          'discount': itemDiscount,
-          'total': itemTotal,
-          'cost': cost,
-          'profit': profit,
-        });
-
-        await transaction.insert('operations', {
-          'operation_type': 'Продажа',
-          'barcode': item.code,
-          'product_name': item.name,
-          'quantity': item.qty,
-          'price': item.price,
-          'discount': itemDiscount,
-          'total': itemTotal,
-          'created_at': DateTime.now().toIso8601String(),
-          'cost': cost,
-          'profit': profit,
-          'seller': seller,
-          'payment_method': paymentMethod,
-        });
+      } catch (e) {
+        print('LOCAL PRODUCT CACHE SYNC ERROR: $e');
       }
-
-      return receiptId;
-    }).then((receiptId) {
-      notifyInventoryChanged();
-      return receiptId;
-    });
+    }
   }
 
   Future<Map<String, dynamic>?> currentShift() async {
-    final rows = await db!.query(
-      'shifts',
-      where: 'status = ?',
-      whereArgs: ['open'],
-      orderBy: 'id DESC',
-      limit: 1,
-    );
-    return rows.isEmpty ? null : rows.first;
+    try {
+      final response = await Supabase.instance.client.rpc(
+        'get_current_shift',
+      );
+
+      if (response == null) return null;
+      if (response is Map) {
+        return Map<String, dynamic>.from(response);
+      }
+
+      return null;
+    } catch (e) {
+      print('SUPABASE CURRENT SHIFT ERROR: $e');
+      rethrow;
+    }
   }
 
   Future<int> openShift(String openedBy, double openingCash) async {
-    if (await currentShift() != null) {
-      throw Exception('Смена уже открыта');
+    try {
+      final response = await Supabase.instance.client.rpc(
+        'open_shift',
+        params: {
+          'p_opening_cash': openingCash,
+        },
+      );
+
+      if (response is Map && response['success'] == true) {
+        return (response['shift_id'] as num).toInt();
+      }
+
+      throw Exception('Не удалось открыть смену на сервере');
+    } catch (e) {
+      print('SUPABASE OPEN SHIFT ERROR: $e');
+      rethrow;
     }
-    return db!.insert('shifts', {
-      'opened_by': openedBy,
-      'opened_at': DateTime.now().toIso8601String(),
-      'opening_cash': openingCash,
-      'status': 'open',
-    });
   }
 
   Future<void> closeShift(
@@ -507,52 +744,86 @@ class DB {
     String closedBy,
     double closingCash,
   ) async {
-    final changed = await db!.update(
-      'shifts',
-      {
-        'closed_by': closedBy,
-        'closed_at': DateTime.now().toIso8601String(),
-        'closing_cash': closingCash,
-        'status': 'closed',
-      },
-      where: 'id = ? AND status = ?',
-      whereArgs: [shiftId, 'open'],
-    );
-    if (changed == 0) {
-      throw Exception('Смена уже закрыта');
+    try {
+      final response = await Supabase.instance.client.rpc(
+        'close_shift',
+        params: {
+          'p_closing_cash': closingCash,
+        },
+      );
+
+      if (response is Map && response['success'] == true) {
+        return;
+      }
+
+      throw Exception('Не удалось закрыть смену на сервере');
+    } catch (e) {
+      print('SUPABASE CLOSE SHIFT ERROR: $e');
+      rethrow;
     }
   }
 
-  Future<Map<String, num>> shiftTotals(int shiftId) async {
-    final rows = await db!.query(
-      'shifts',
-      where: 'id = ?',
-      whereArgs: [shiftId],
-      limit: 1,
-    );
-    if (rows.isEmpty) throw Exception('Смена не найдена');
+Future<Map<String, num>> shiftTotals(int shiftId) async {
+  // Продажи берём из серверных чеков текущей смены.
+  final receiptsResponse = await Supabase.instance.client
+      .from('receipts')
+      .select('id,total,shift_id')
+      .eq('shift_id', shiftId);
 
-    final openedAt = rows.first['opened_at'].toString();
-    final closedAt = rows.first['closed_at']?.toString();
+  final receipts = (receiptsResponse as List)
+      .map((row) => Map<String, dynamic>.from(row as Map))
+      .toList();
 
-    final where = closedAt == null
-        ? 'created_at >= ?'
-        : 'created_at >= ? AND created_at <= ?';
-    final args = closedAt == null
-        ? <Object?>[openedAt]
-        : <Object?>[openedAt, closedAt];
+  double sales = 0;
+  final receiptIds = <int>{};
 
-    final row = (await db!.rawQuery(
-      'SELECT '
-      'COALESCE(SUM(CASE WHEN operation_type = "Продажа" THEN total ELSE 0 END),0) AS sales, '
-      'COALESCE(SUM(CASE WHEN operation_type = "Возврат" THEN total ELSE 0 END),0) AS returns, '
-      'COALESCE(SUM(CASE WHEN operation_type = "Продажа" THEN quantity ELSE 0 END),0) AS sold '
-      'FROM operations WHERE $where',
-      args,
-    )).first;
+  for (final row in receipts) {
+    sales += (row['total'] as num?)?.toDouble() ?? 0;
 
-    return row.map((key, value) => MapEntry(key, value as num));
+    final id = (row['id'] as num?)?.toInt();
+    if (id != null) {
+      receiptIds.add(id);
+    }
   }
+
+  double sold = 0;
+
+  if (receiptIds.isNotEmpty) {
+    final itemsResponse = await Supabase.instance.client
+        .from('receipt_items')
+        .select('receipt_id,quantity');
+
+    for (final raw in (itemsResponse as List)) {
+      final row = Map<String, dynamic>.from(raw as Map);
+      final receiptId = (row['receipt_id'] as num?)?.toInt();
+
+      if (receiptId != null && receiptIds.contains(receiptId)) {
+        sold += (row['quantity'] as num?)?.toDouble() ?? 0;
+      }
+    }
+  }
+
+  double returns = 0;
+
+  final operationsResponse = await Supabase.instance.client
+      .from('operations')
+      .select('operation_type,total,quantity,shift_id')
+      .eq('shift_id', shiftId);
+
+  for (final raw in (operationsResponse as List)) {
+    final row = Map<String, dynamic>.from(raw as Map);
+
+    if (row['operation_type']?.toString() == 'Возврат') {
+      returns += (row['total'] as num?)?.toDouble() ?? 0;
+    }
+  }
+
+  return <String, num>{
+    'sales': sales,
+    'returns': returns,
+    'sold': sold,
+  };
+}
 
   Future<List<Map<String, dynamic>>> receipts(
     String seller, {
@@ -560,62 +831,90 @@ class DB {
     DateTime? to,
     String paymentMethod = '',
   }) async {
-    final conditions = <String>[];
-    final args = <Object?>[];
+    // Чеки хранятся на сервере Supabase. Локальная SQLite больше
+    // не является источником списка чеков.
+    var query = Supabase.instance.client
+        .from('receipts')
+        .select();
 
     if (seller.isNotEmpty) {
-      conditions.add('seller = ?');
-      args.add(seller);
+      query = query.eq('seller', seller);
     }
 
     if (from != null) {
       final start = DateTime(from.year, from.month, from.day);
-      conditions.add('datetime(created_at) >= datetime(?)');
-      args.add(start.toIso8601String());
+      query = query.gte('created_at', start.toUtc().toIso8601String());
     }
 
     if (to != null) {
-      final end = DateTime(to.year, to.month, to.day).add(const Duration(days: 1));
-      conditions.add('datetime(created_at) < datetime(?)');
-      args.add(end.toIso8601String());
+      final end = DateTime(to.year, to.month, to.day)
+          .add(const Duration(days: 1));
+      query = query.lt('created_at', end.toUtc().toIso8601String());
     }
 
-    if (paymentMethod.isNotEmpty) {
-      conditions.add('payment_method = ?');
-      args.add(paymentMethod);
+    final serverPayment = switch (paymentMethod) {
+      'Наличные' => 'cash',
+      'Карта' => 'card',
+      'Перевод' => 'transfer',
+      _ => '',
+    };
+
+    if (serverPayment.isNotEmpty) {
+      query = query.eq('payment_method', serverPayment);
     }
 
-    return db!.query(
-      'receipts',
-      where: conditions.isEmpty ? null : conditions.join(' AND '),
-      whereArgs: conditions.isEmpty ? null : args,
-      orderBy: 'id DESC',
-      limit: 500,
-    );
+    final rows = await query.order('id', ascending: false).limit(500);
+
+    return (rows as List)
+        .map((row) {
+          final item = Map<String, dynamic>.from(row as Map);
+          final method = item['payment_method']?.toString() ?? '';
+          item['payment_method'] = switch (method) {
+            'cash' => 'Наличные',
+            'card' => 'Карта',
+            'transfer' => 'Перевод',
+            _ => method,
+          };
+          return item;
+        })
+        .toList();
   }
 
   Future<List<Map<String, dynamic>>> receiptItems(
     int receiptId,
   ) async {
-    return db!.query(
-      'receipt_items',
-      where: 'receipt_id = ?',
-      whereArgs: [receiptId],
-      orderBy: 'id ASC',
-    );
+    final rows = await Supabase.instance.client
+        .from('receipt_items')
+        .select()
+        .eq('receipt_id', receiptId)
+        .order('id', ascending: true);
+
+    return (rows as List)
+        .map((row) => Map<String, dynamic>.from(row as Map))
+        .toList();
   }
 
   Future<Map<String, dynamic>?> receipt(
     int receiptId,
   ) async {
-    final rows = await db!.query(
-      'receipts',
-      where: 'id = ?',
-      whereArgs: [receiptId],
-      limit: 1,
-    );
+    final row = await Supabase.instance.client
+        .from('receipts')
+        .select()
+        .eq('id', receiptId)
+        .maybeSingle();
 
-    return rows.isEmpty ? null : rows.first;
+    if (row == null) return null;
+
+    final result = Map<String, dynamic>.from(row);
+    final method = result['payment_method']?.toString() ?? '';
+    result['payment_method'] = switch (method) {
+      'cash' => 'Наличные',
+      'card' => 'Карта',
+      'transfer' => 'Перевод',
+      _ => method,
+    };
+
+    return result;
   }
 
   Future<void> stock(
@@ -628,59 +927,115 @@ class DB {
       throw Exception('Смена не открыта. Сначала откройте смену.');
     }
 
-    await db!.transaction((transaction) async {
-      final rows = await transaction.query(
-        'products',
-        where: 'id = ?',
-        whereArgs: [productId],
-        limit: 1,
-      );
+    if (delta == 0) {
+      throw Exception('Изменение количества не может быть равно нулю');
+    }
 
-      if (rows.isEmpty) {
-        throw Exception('Товар не найден');
-      }
+    // Сначала меняем остаток на сервере Supabase.
+    // Для возврата остаток увеличивается, для брака уменьшается.
+    final productRows = await db!.query(
+      'products',
+      where: 'id = ?',
+      whereArgs: [productId],
+      limit: 1,
+    );
+    if (productRows.isEmpty) throw Exception('Товар не найден');
 
-      final product = rows.first;
-      final oldQuantity = (product['quantity'] as num).toInt();
-      final newQuantity = oldQuantity + delta;
+    final product = productRows.first;
+    final barcode = product['barcode']?.toString() ?? '';
+    if (barcode.isEmpty) throw Exception('У товара нет штрихкода');
 
-      if (newQuantity < 0) {
-        throw Exception('Недостаточно товара на складе');
-      }
+    await _applyStockAdjustmentToSupabase(
+      barcode: barcode,
+      delta: delta,
+      type: type,
+    );
 
-      final quantity = delta.abs();
-      final purchasePrice =
-          (product['purchase_price'] as num?)?.toDouble() ?? 0;
-      final price = (product['price'] as num).toDouble();
+    try {
+      await db!.transaction((transaction) async {
+        final rows = await transaction.query(
+          'products',
+          where: 'id = ?',
+          whereArgs: [productId],
+          limit: 1,
+        );
 
-      await transaction.update(
-        'products',
-        {'quantity': newQuantity},
-        where: 'id = ?',
-        whereArgs: [productId],
-      );
+        if (rows.isEmpty) {
+          throw Exception('Товар не найден');
+        }
 
-      final total = type == 'Возврат' ? price * quantity : 0.0;
-      final profit = type == 'Брак'
-          ? -purchasePrice * quantity
-          : -(price * quantity - purchasePrice * quantity);
+        final localProduct = rows.first;
+        final oldQuantity = (localProduct['quantity'] as num).toInt();
+        final newQuantity = oldQuantity + delta;
 
-      await transaction.insert('operations', {
-        'operation_type': type,
-        'barcode': product['barcode'],
-        'product_name': product['name'],
-        'quantity': quantity,
-        'price': price,
-        'discount': 0,
-        'total': total,
-        'created_at': DateTime.now().toIso8601String(),
-        'cost': purchasePrice * quantity,
-        'profit': profit,
-        'seller': seller,
+        if (newQuantity < 0) {
+          throw Exception('Недостаточно товара на складе');
+        }
+
+        final quantity = delta.abs();
+        final purchasePrice =
+            (localProduct['purchase_price'] as num?)?.toDouble() ?? 0;
+        final price = (localProduct['price'] as num).toDouble();
+
+        await transaction.update(
+          'products',
+          {'quantity': newQuantity},
+          where: 'id = ?',
+          whereArgs: [productId],
+        );
+
+        final total = type == 'Возврат' ? price * quantity : 0.0;
+        final profit = type == 'Брак'
+            ? -purchasePrice * quantity
+            : -(price * quantity - purchasePrice * quantity);
+
+        await transaction.insert('operations', {
+          'operation_type': type,
+          'barcode': localProduct['barcode'],
+          'product_name': localProduct['name'],
+          'quantity': quantity,
+          'price': price,
+          'discount': 0,
+          'total': total,
+          'created_at': DateTime.now().toIso8601String(),
+          'cost': purchasePrice * quantity,
+          'profit': profit,
+          'seller': seller,
+        });
       });
-    });
 
-    notifyInventoryChanged();
+      notifyInventoryChanged();
+    } catch (e) {
+      // Если локальная запись не удалась, возвращаем серверный остаток назад.
+      try {
+        await _applyStockAdjustmentToSupabase(
+          barcode: barcode,
+          delta: -delta,
+          type: type,
+          compensation: true,
+        );
+      } catch (restoreError) {
+        print('SUPABASE STOCK RESTORE ERROR: $restoreError');
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> _applyStockAdjustmentToSupabase({
+    required String barcode,
+    required int delta,
+    required String type,
+    bool compensation = false,
+  }) async {
+    await Supabase.instance.client.rpc(
+      'process_stock_adjustment',
+      params: {
+        'p_barcode': barcode,
+        'p_delta': delta,
+        'p_type': type,
+        'p_compensation': compensation,
+      },
+    );
   }
 
   Future<int> purchase(
@@ -698,67 +1053,131 @@ class DB {
       throw Exception('Смена не открыта. Сначала откройте смену.');
     }
 
-    final reportId = await db!.transaction<int>((transaction) async {
-      final rows = await transaction.query(
-        'products',
-        where: 'id = ?',
-        whereArgs: [productId],
-        limit: 1,
-      );
-      if (rows.isEmpty) throw Exception('Товар не найден');
+    final productRows = await db!.query(
+      'products',
+      where: 'id = ?',
+      whereArgs: [productId],
+      limit: 1,
+    );
+    if (productRows.isEmpty) throw Exception('Товар не найден');
 
-      final product = rows.first;
-      final oldQuantity = (product['quantity'] as num).toInt();
-      final price = (product['price'] as num).toDouble();
-      final cost = purchasePrice * quantity;
-      final now = DateTime.now().toIso8601String();
+    final productBefore = productRows.first;
+    final barcode = productBefore['barcode']?.toString() ?? '';
+    if (barcode.isEmpty) throw Exception('У товара нет штрихкода');
+    final oldPurchasePrice =
+        (productBefore['purchase_price'] as num?)?.toDouble() ?? 0;
 
-      await transaction.update(
-        'products',
-        {
-          'quantity': oldQuantity + quantity,
+    // Закупка тоже меняет серверный остаток, а не только SQLite.
+    await _applyPurchaseToSupabase(
+      barcode: barcode,
+      quantity: quantity,
+      purchasePrice: purchasePrice,
+    );
+
+    try {
+      final reportId = await db!.transaction<int>((transaction) async {
+        final rows = await transaction.query(
+          'products',
+          where: 'id = ?',
+          whereArgs: [productId],
+          limit: 1,
+        );
+        if (rows.isEmpty) throw Exception('Товар не найден');
+
+        final product = rows.first;
+        final oldQuantity = (product['quantity'] as num).toInt();
+        final price = (product['price'] as num).toDouble();
+        final cost = purchasePrice * quantity;
+        final now = DateTime.now().toIso8601String();
+
+        await transaction.update(
+          'products',
+          {
+            'quantity': oldQuantity + quantity,
+            'purchase_price': purchasePrice,
+          },
+          where: 'id = ?',
+          whereArgs: [productId],
+        );
+
+        await transaction.insert('operations', {
+          'operation_type': 'Закупка',
+          'barcode': product['barcode'],
+          'product_name': product['name'],
+          'quantity': quantity,
+          'price': price,
+          'discount': 0,
+          'total': 0,
+          'created_at': now,
+          'cost': cost,
+          'profit': 0,
+          'seller': seller,
+          'payment_method': 'Наличные',
+        });
+
+        final id = await transaction.insert('purchase_reports', {
+          'product_id': productId,
+          'seller': seller,
+          'quantity': quantity,
           'purchase_price': purchasePrice,
-        },
-        where: 'id = ?',
-        whereArgs: [productId],
-      );
-
-      await transaction.insert('operations', {
-        'operation_type': 'Закупка',
-        'barcode': product['barcode'],
-        'product_name': product['name'],
-        'quantity': quantity,
-        'price': price,
-        'discount': 0,
-        'total': 0,
-        'created_at': now,
-        'cost': cost,
-        'profit': 0,
-        'seller': seller,
-        'payment_method': 'Наличные',
-      });
-
-      final id = await transaction.insert('purchase_reports', {
-        'product_id': productId,
-        'seller': seller,
-        'quantity': quantity,
-        'purchase_price': purchasePrice,
-        'created_at': now,
-      });
-
-      for (final path in photoPaths) {
-        await transaction.insert('purchase_photos', {
-          'report_id': id,
-          'file_path': path,
           'created_at': now,
         });
+
+        for (final path in photoPaths) {
+          await transaction.insert('purchase_photos', {
+            'report_id': id,
+            'file_path': path,
+            'created_at': now,
+          });
+        }
+
+        return id;
+      });
+
+      notifyInventoryChanged();
+      return reportId;
+    } catch (e) {
+      try {
+        await _restorePurchaseOnSupabase(
+          barcode: barcode,
+          quantity: quantity,
+          oldPurchasePrice: oldPurchasePrice,
+        );
+      } catch (restoreError) {
+        print('SUPABASE PURCHASE RESTORE ERROR: $restoreError');
       }
+      rethrow;
+    }
+  }
 
-      return id;
-    });
+  Future<void> _applyPurchaseToSupabase({
+    required String barcode,
+    required int quantity,
+    required double purchasePrice,
+  }) async {
+    await Supabase.instance.client.rpc(
+      'process_purchase_stock',
+      params: {
+        'p_barcode': barcode,
+        'p_quantity': quantity,
+        'p_purchase_price': purchasePrice,
+      },
+    );
+  }
 
-    notifyInventoryChanged();
-    return reportId;
+  Future<void> _restorePurchaseOnSupabase({
+    required String barcode,
+    required int quantity,
+    required double oldPurchasePrice,
+  }) async {
+    await Supabase.instance.client.rpc(
+      'restore_purchase_stock',
+      params: {
+        'p_barcode': barcode,
+        'p_quantity': quantity,
+        'p_purchase_price': oldPurchasePrice,
+      },
+    );
   }
 
   Future<List<Map<String, dynamic>>> purchaseReports({
@@ -782,130 +1201,60 @@ class DB {
     );
   }
 
-  Future<List<Map<String, dynamic>>> productHistory(
-    int productId,
-    String seller,
-  ) async {
-    final productRows = await db!.query(
-      'products',
-      where: 'id = ?',
-      whereArgs: [productId],
-      limit: 1,
-    );
-    if (productRows.isEmpty) throw Exception('Товар не найден');
-    final name = productRows.first['name'].toString();
-    final conditions = <String>['product_name = ?'];
-    final args = <Object?>[name];
-    if (seller.isNotEmpty) {
-      conditions.add('seller = ?');
-      args.add(seller);
-    }
-    return db!.query(
-      'operations',
-      where: conditions.join(' AND '),
-      whereArgs: args,
-      orderBy: 'id DESC',
-      limit: 500,
-    );
+ Future<List<Map<String, dynamic>>> productHistory(
+  int productId,
+  String seller,
+) async {
+  final productRows = await db!.query(
+    'products',
+    where: 'id = ?',
+    whereArgs: [productId],
+    limit: 1,
+  );
+
+  if (productRows.isEmpty) {
+    throw Exception('Товар не найден');
   }
 
-  Future<List<Map<String, dynamic>>> dailySales(String seller) async {
-    final conditions = <String>[];
-    final args = <Object?>[];
+  final barcode = productRows.first['barcode']?.toString() ?? '';
 
-    if (seller.isNotEmpty) {
-      conditions.add('r.seller = ?');
-      args.add(seller);
-    }
-
-    final where = conditions.isEmpty
-        ? ''
-        : ' WHERE ${conditions.join(' AND ')}';
-
-    // Дневные продажи считаются только по реально оформленным чекам.
-    return db!.rawQuery(
-      '''
-      SELECT
-        date(r.created_at) AS day,
-        COUNT(r.id) AS sales,
-        COALESCE(SUM(it.sold), 0) AS sold,
-        COALESCE(SUM(r.total), 0) AS revenue,
-        COALESCE(SUM(it.profit), 0) AS profit
-      FROM receipts r
-      LEFT JOIN (
-        SELECT
-          receipt_id,
-          SUM(quantity) AS sold,
-          SUM(profit) AS profit
-        FROM receipt_items
-        GROUP BY receipt_id
-      ) it ON it.receipt_id = r.id
-      $where
-      GROUP BY date(r.created_at)
-      ORDER BY day DESC
-      LIMIT 90
-      ''',
-      args,
-    );
+  if (barcode.isEmpty) {
+    throw Exception('У товара нет штрихкода');
   }
 
-  Future<List<Map<String, dynamic>>> ops(
-    String seller, {
-    String? productName,
-    String? operationType,
-  }) async {
-    final conditions = <String>[];
-    final args = <Object?>[];
+  dynamic query = Supabase.instance.client
+      .from('operations')
+      .select()
+      .eq('barcode', barcode);
 
-    if (seller.isNotEmpty) {
-      conditions.add('seller = ?');
-      args.add(seller);
-    }
-
-    if (productName != null && productName.isNotEmpty) {
-      conditions.add('product_name = ?');
-      args.add(productName);
-    }
-
-    if (operationType != null && operationType.isNotEmpty) {
-      conditions.add('operation_type = ?');
-      args.add(operationType);
-    }
-
-    return db!.query(
-      'operations',
-      where: conditions.isEmpty ? null : conditions.join(' AND '),
-      whereArgs: conditions.isEmpty ? null : args,
-      orderBy: 'id DESC',
-      limit: 300,
-    );
+  if (seller.isNotEmpty) {
+    query = query.eq('seller', seller);
   }
 
-  Future<Map<String, num>> stats(
+  final response = await query
+      .order('id', ascending: false)
+      .limit(500);
+
+  return (response as List)
+      .map((row) => Map<String, dynamic>.from(row as Map))
+      .toList();
+}
+
+  Future<List<Map<String, dynamic>>> dailySales(
     String seller, [
     String period = 'all',
   ]) async {
-    final receiptConditions = <String>[];
-    final receiptArgs = <Object?>[];
-
-    if (seller.isNotEmpty) {
-      receiptConditions.add('r.seller = ?');
-      receiptArgs.add(seller);
-    }
-
     DateTime? start;
     DateTime? end;
 
     if (period != 'all') {
       final now = DateTime.now();
-
       if (period == 'today') {
         start = DateTime(now.year, now.month, now.day);
         end = start.add(const Duration(days: 1));
       } else if (period == 'week') {
-        end = DateTime(now.year, now.month, now.day).add(
-          const Duration(days: 1),
-        );
+        end = DateTime(now.year, now.month, now.day)
+            .add(const Duration(days: 1));
         start = end.subtract(const Duration(days: 7));
       } else if (period == 'month') {
         start = DateTime(now.year, now.month);
@@ -915,100 +1264,215 @@ class DB {
       }
     }
 
-    if (start != null && end != null) {
-      receiptConditions.add('r.created_at >= ? AND r.created_at < ?');
-      receiptArgs.add(start.toIso8601String());
-      receiptArgs.add(end.toIso8601String());
+    final periodStart = start;
+    final periodEnd = end;
+
+    bool inPeriod(Object? value) {
+      if (periodStart == null || periodEnd == null) return true;
+      final date = DateTime.tryParse(value?.toString() ?? '');
+      if (date == null) return false;
+      final local = date.isUtc ? date.toLocal() : date;
+      return !local.isBefore(periodStart) && local.isBefore(periodEnd);
     }
 
-    final receiptWhere = receiptConditions.isEmpty
-        ? ''
-        : ' WHERE ${receiptConditions.join(' AND ')}';
+    final receiptsResponse = await Supabase.instance.client
+        .from('receipts')
+        .select('id,total,seller,created_at')
+        .order('created_at', ascending: false);
 
-    // Реальные продажи и выручка считаются по чекам.
-    final salesRow = (await db!.rawQuery(
-      '''
-      SELECT
-        COUNT(r.id) AS sales,
-        COALESCE(SUM(r.total), 0) AS revenue
-      FROM receipts r
-      $receiptWhere
-      ''',
-      receiptArgs,
-    )).first;
+    final receipts = (receiptsResponse as List)
+        .map((row) => Map<String, dynamic>.from(row as Map))
+        .where((row) => seller.isEmpty || row['seller']?.toString() == seller)
+        .where((row) => inPeriod(row['created_at']))
+        .toList();
 
-    final itemConditions = <String>[];
-    final itemArgs = <Object?>[];
+    if (receipts.isEmpty) return [];
+
+    final receiptIds = receipts
+        .map((row) => (row['id'] as num?)?.toInt())
+        .whereType<int>()
+        .toSet();
+
+    final itemsResponse = await Supabase.instance.client
+        .from('receipt_items')
+        .select('receipt_id,quantity');
+
+    final soldByReceipt = <int, int>{};
+    for (final raw in (itemsResponse as List)) {
+      final row = Map<String, dynamic>.from(raw as Map);
+      final receiptId = (row['receipt_id'] as num?)?.toInt();
+      if (receiptId == null || !receiptIds.contains(receiptId)) continue;
+      soldByReceipt[receiptId] =
+          (soldByReceipt[receiptId] ?? 0) +
+          ((row['quantity'] as num?)?.toInt() ?? 0);
+    }
+
+    final grouped = <String, Map<String, dynamic>>{};
+    for (final receipt in receipts) {
+      final date = DateTime.tryParse(receipt['created_at']?.toString() ?? '');
+      if (date == null) continue;
+      final local = date.isUtc ? date.toLocal() : date;
+      final day =
+          '${local.year.toString().padLeft(4, '0')}-'
+          '${local.month.toString().padLeft(2, '0')}-'
+          '${local.day.toString().padLeft(2, '0')}';
+      final id = (receipt['id'] as num?)?.toInt();
+      final row = grouped.putIfAbsent(
+        day,
+        () => {
+          'day': day,
+          'sales': 0,
+          'sold': 0,
+          'revenue': 0.0,
+        },
+      );
+      row['sales'] = (row['sales'] as int) + 1;
+      row['sold'] = (row['sold'] as int) + (id == null ? 0 : (soldByReceipt[id] ?? 0));
+      row['revenue'] =
+          (row['revenue'] as double) +
+          ((receipt['total'] as num?)?.toDouble() ?? 0);
+    }
+
+    final result = grouped.values.toList();
+    result.sort((a, b) => b['day'].toString().compareTo(a['day'].toString()));
+    return result.take(90).toList();
+  }
+
+  Future<List<Map<String, dynamic>>> ops(
+    String seller, {
+    String? productName,
+    String? operationType,
+  }) async {
+    dynamic query = Supabase.instance.client
+        .from('operations')
+        .select();
 
     if (seller.isNotEmpty) {
-      itemConditions.add('r.seller = ?');
-      itemArgs.add(seller);
+      query = query.eq('seller', seller);
     }
 
-    if (start != null && end != null) {
-      itemConditions.add('r.created_at >= ? AND r.created_at < ?');
-      itemArgs.add(start.toIso8601String());
-      itemArgs.add(end.toIso8601String());
+    if (productName != null && productName.isNotEmpty) {
+      query = query.eq('product_name', productName);
     }
 
-    final itemWhere = itemConditions.isEmpty
-        ? ''
-        : ' WHERE ${itemConditions.join(' AND ')}';
-
-    final itemRow = (await db!.rawQuery(
-      '''
-      SELECT
-        COALESCE(SUM(ri.quantity), 0) AS sold,
-        COALESCE(SUM(ri.profit), 0) AS profit
-      FROM receipt_items ri
-      INNER JOIN receipts r ON r.id = ri.receipt_id
-      $itemWhere
-      ''',
-      itemArgs,
-    )).first;
-
-    final operationConditions = <String>[];
-    final operationArgs = <Object?>[];
-
-    if (seller.isNotEmpty) {
-      operationConditions.add('seller = ?');
-      operationArgs.add(seller);
+    if (operationType != null && operationType.isNotEmpty) {
+      query = query.eq('operation_type', operationType);
     }
 
-    if (start != null && end != null) {
-      operationConditions.add('created_at >= ? AND created_at < ?');
-      operationArgs.add(start.toIso8601String());
-      operationArgs.add(end.toIso8601String());
+    final response = await query
+        .order('id', ascending: false)
+        .limit(300);
+
+    return (response as List)
+        .map((row) => Map<String, dynamic>.from(row as Map))
+        .toList();
+  }
+
+  Future<Map<String, num>> stats(
+    String seller, [
+    String period = 'all',
+  ]) async {
+    DateTime? start;
+    DateTime? end;
+
+    if (period != 'all') {
+      final now = DateTime.now();
+      if (period == 'today') {
+        start = DateTime(now.year, now.month, now.day);
+        end = start.add(const Duration(days: 1));
+      } else if (period == 'week') {
+        end = DateTime(now.year, now.month, now.day)
+            .add(const Duration(days: 1));
+        start = end.subtract(const Duration(days: 7));
+      } else if (period == 'month') {
+        start = DateTime(now.year, now.month);
+        end = now.month == 12
+            ? DateTime(now.year + 1, 1)
+            : DateTime(now.year, now.month + 1);
+      }
     }
 
-    final operationWhere = operationConditions.isEmpty
-        ? ''
-        : ' WHERE ${operationConditions.join(' AND ')}';
+    final periodStart = start;
+    final periodEnd = end;
 
-    final operationRow = (await db!.rawQuery(
-      '''
-      SELECT
-        COALESCE(SUM(
-          CASE WHEN operation_type = 'Возврат'
-          THEN total ELSE 0 END
-        ), 0) AS returns,
-        COALESCE(SUM(
-          CASE WHEN operation_type = 'Брак'
-          THEN quantity ELSE 0 END
-        ), 0) AS defects
-      FROM operations
-      $operationWhere
-      ''',
-      operationArgs,
-    )).first;
+    bool inPeriod(Object? value) {
+      if (periodStart == null || periodEnd == null) return true;
+      final date = DateTime.tryParse(value?.toString() ?? '');
+      if (date == null) return false;
+      final local = date.isUtc ? date.toLocal() : date;
+      return !local.isBefore(periodStart) && local.isBefore(periodEnd);
+    }
+
+    final receipts = await Supabase.instance.client
+        .from('receipts')
+        .select('id,total,seller,created_at')
+        .order('id', ascending: false);
+
+    final receiptRows = (receipts as List)
+        .map((row) => Map<String, dynamic>.from(row as Map))
+        .where((row) => seller.isEmpty || row['seller']?.toString() == seller)
+        .where((row) => inPeriod(row['created_at']))
+        .toList();
+
+    final receiptIds = receiptRows
+        .map((row) => (row['id'] as num?)?.toInt())
+        .whereType<int>()
+        .toSet();
+
+    double revenue = 0;
+    for (final row in receiptRows) {
+      revenue += (row['total'] as num?)?.toDouble() ?? 0;
+    }
+
+    double sold = 0;
+    double profit = 0;
+
+    if (receiptIds.isNotEmpty) {
+      final items = await Supabase.instance.client
+          .from('receipt_items')
+          .select('receipt_id,quantity,profit');
+
+      for (final raw in (items as List)) {
+        final row = Map<String, dynamic>.from(raw as Map);
+        final receiptId = (row['receipt_id'] as num?)?.toInt();
+        if (receiptId != null && receiptIds.contains(receiptId)) {
+          sold += (row['quantity'] as num?)?.toDouble() ?? 0;
+          profit += (row['profit'] as num?)?.toDouble() ?? 0;
+        }
+      }
+    }
+
+    double returns = 0;
+    double defects = 0;
+
+    final operations = await Supabase.instance.client
+        .from('operations')
+        .select('operation_type,total,quantity,seller,created_at')
+        .order('id', ascending: false)
+        .limit(1000);
+
+    for (final raw in (operations as List)) {
+      final row = Map<String, dynamic>.from(raw as Map);
+      if (seller.isNotEmpty && row['seller']?.toString() != seller) {
+        continue;
+      }
+      if (!inPeriod(row['created_at'])) continue;
+
+      final type = row['operation_type']?.toString();
+      if (type == 'Возврат') {
+        returns += (row['total'] as num?)?.toDouble() ?? 0;
+      } else if (type == 'Брак') {
+        defects += (row['quantity'] as num?)?.toDouble() ?? 0;
+      }
+    }
 
     return <String, num>{
-      'sales': (salesRow['sales'] as num?) ?? 0,
-      'sold': (itemRow['sold'] as num?) ?? 0,
-      'revenue': (salesRow['revenue'] as num?) ?? 0,
-      'profit': (itemRow['profit'] as num?) ?? 0,
-      'returns': (operationRow['returns'] as num?) ?? 0,
-      'defects': (operationRow['defects'] as num?) ?? 0,
+      'sales': receiptRows.length,
+      'sold': sold,
+      'revenue': revenue,
+      'profit': profit,
+      'returns': returns,
+      'defects': defects,
     };
   }
 
@@ -1149,25 +1613,107 @@ class DB {
     notifyInventoryChanged();
   }
 
-  Future<void> backup() async {
-    final databaseFile = File(
-      p.join(await getDatabasesPath(), 'shop.db'),
-    );
+  Future<Map<String, dynamic>> restoreBackupFromFile(
+    String filePath,
+  ) async {
+    final raw = await File(filePath).readAsString();
+    final decoded = jsonDecode(raw);
 
-    final backupDirectory = Directory(
-      p.join(await getDatabasesPath(), 'backups'),
-    );
-
-    if (!await backupDirectory.exists()) {
-      await backupDirectory.create(recursive: true);
+    if (decoded is! Map) {
+      throw Exception('Файл резервной копии имеет неверный формат');
     }
 
-    final filename =
-        'shop_${DateTime.now().millisecondsSinceEpoch}.db';
+    final backupData = Map<String, dynamic>.from(decoded);
 
-    await databaseFile.copy(
-      p.join(backupDirectory.path, filename),
+    if ((backupData['backup_version'] as num?)?.toInt() != 1) {
+      throw Exception('Неподдерживаемая версия резервной копии');
+    }
+
+    final response = await Supabase.instance.client.rpc(
+      'restore_shop_backup',
+      params: {'p_backup': backupData},
     );
+
+    if (response is! Map) {
+      throw Exception('Сервер не подтвердил восстановление');
+    }
+
+    final database = db!;
+    await database.transaction((txn) async {
+      await txn.delete('receipt_items');
+      await txn.delete('operations');
+      await txn.delete('receipts');
+      await txn.delete('purchase_photos');
+      await txn.delete('purchase_reports');
+      await txn.delete('shifts');
+      await txn.delete('products');
+
+      await txn.rawDelete(
+        "DELETE FROM sqlite_sequence WHERE name IN "
+        "('receipt_items', 'receipts', 'operations', "
+        "'purchase_photos', 'purchase_reports', 'shifts', 'products')",
+      );
+    });
+
+    await serverProducts();
+    notifyInventoryChanged();
+
+    return backupData;
+  }
+
+  Future<String?> backup() async {
+    final client = Supabase.instance.client;
+    final authUser = client.auth.currentUser;
+
+    if (authUser == null) {
+      throw Exception('Пользователь не авторизован');
+    }
+
+    final profile = await client
+        .from('users')
+        .select('role, active')
+        .eq('auth_user_id', authUser.id)
+        .maybeSingle();
+
+    if (profile == null ||
+        profile['role'] != 'admin' ||
+        profile['active'] != true) {
+      throw Exception(
+        'Только активный администратор может создавать резервную копию',
+      );
+    }
+
+    final response = await client.rpc('create_shop_backup');
+
+    if (response is! Map) {
+      throw Exception('Сервер вернул некорректную резервную копию');
+    }
+
+    final backupData = Map<String, dynamic>.from(response);
+
+    final now = DateTime.now();
+    final stamp =
+        '${now.year.toString().padLeft(4, '0')}'
+        '${now.month.toString().padLeft(2, '0')}_'
+        '${now.day.toString().padLeft(2, '0')}_'
+        '${now.hour.toString().padLeft(2, '0')}'
+        '${now.minute.toString().padLeft(2, '0')}_'
+        '${now.second.toString().padLeft(2, '0')}';
+
+    final fileName = 'shop_backup_$stamp.json';
+    final jsonText = const JsonEncoder.withIndent('  ').convert(backupData);
+
+    // Сохраняем через системное окно Android/iOS, чтобы файл
+    // находился в обычном доступном пользователю месте.
+    final savedPath = await FilePicker.platform.saveFile(
+      dialogTitle: 'Сохранить резервную копию',
+      fileName: fileName,
+      type: FileType.custom,
+      allowedExtensions: ['json'],
+      bytes: Uint8List.fromList(utf8.encode(jsonText)),
+    );
+
+    return savedPath;
   }
 }
 
@@ -1337,9 +1883,11 @@ class _LoginState extends State<Login> {
               const SizedBox(height: 40),
               TextField(
                 controller: usernameController,
-                decoration: const InputDecoration(
-                  labelText: 'Логин',
-                  prefixIcon: Icon(Icons.person),
+                 keyboardType: TextInputType.emailAddress,
+                 decoration: const InputDecoration(
+                   labelText: 'Email',
+                   hintText: 'Введите email',
+                   prefixIcon: Icon(Icons.email),
                 ),
               ),
               const SizedBox(height: 12),
@@ -1354,25 +1902,25 @@ class _LoginState extends State<Login> {
               ),
               const SizedBox(height: 20),
               FilledButton(
-                onPressed: busy ? null : login,
-                style: FilledButton.styleFrom(
-                  minimumSize: const Size.fromHeight(54),
-                ),
-                child: busy
-                    ? const SizedBox(
-                        width: 22,
-                        height: 22,
-                        child: CircularProgressIndicator(),
-                      )
-                    : const Text('Войти'),
-              ),
-              const SizedBox(height: 14),
-              const Text(
-                'Первый вход: admin / admin123',
-                style: TextStyle(
-                  color: Colors.white38,
-                ),
-              ),
+  onPressed: busy ? null : login,
+  style: FilledButton.styleFrom(
+    minimumSize: const Size.fromHeight(54),
+  ),
+  child: busy
+      ? const SizedBox(
+          width: 22,
+          height: 22,
+          child: CircularProgressIndicator(),
+        )
+      : const Text('Войти'),
+),
+const SizedBox(height: 14),
+const Text(
+  'Вход через сервер',
+  style: TextStyle(
+    color: Colors.white38,
+  ),
+),
             ],
           ),
         ),
@@ -1395,19 +1943,70 @@ class Shell extends StatefulWidget {
   State<Shell> createState() => _ShellState();
 }
 
-class _ShellState extends State<Shell> {
+class _ShellState extends State<Shell> with WidgetsBindingObserver {
   int index = 0;
+  late Map<String, dynamic> currentUser;
+  bool refreshingPermissions = false;
+
+  @override
+  void initState() {
+    super.initState();
+    currentUser = Map<String, dynamic>.from(widget.user);
+    WidgetsBinding.instance.addObserver(this);
+    _refreshPermissions();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _refreshPermissions();
+    }
+  }
+
+  Future<void> _refreshPermissions() async {
+    if (refreshingPermissions) return;
+
+    final authUser = Supabase.instance.client.auth.currentUser;
+    if (authUser == null) return;
+
+    refreshingPermissions = true;
+    try {
+      final profile = await Supabase.instance.client
+          .from('users')
+          .select()
+          .eq('auth_user_id', authUser.id)
+          .eq('active', true)
+          .maybeSingle();
+
+      if (!mounted || profile == null) return;
+
+      setState(() {
+        currentUser = Map<String, dynamic>.from(profile);
+      });
+    } catch (e) {
+      print('PERMISSIONS REFRESH ERROR: $e');
+    } finally {
+      refreshingPermissions = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     final pages = [
-      Home(user: widget.user),
-      Products(user: widget.user),
-      Sale(user: widget.user),
-      Stats(user: widget.user),
+      Home(user: currentUser),
+      Products(user: currentUser),
+      Sale(user: currentUser),
+      Stats(user: currentUser),
       More(
-        user: widget.user,
+        user: currentUser,
         logout: widget.logout,
+        onRefreshPermissions: _refreshPermissions,
       ),
     ];
 
@@ -1791,6 +2390,7 @@ class _ProductsState extends State<Products> {
 
                       return Card(
                         child: ListTile(
+                          onTap: () => showProductPhotos(context, product),
                           contentPadding:
                               const EdgeInsets.symmetric(
                             horizontal: 14,
@@ -1831,6 +2431,192 @@ class _ProductsState extends State<Products> {
                   ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+
+Future<void> showProductPhotos(
+  BuildContext context,
+  Map<String, dynamic> product,
+) async {
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    builder: (_) => ProductPhotosSheet(product: product),
+  );
+}
+
+class ProductPhotosSheet extends StatefulWidget {
+  final Map<String, dynamic> product;
+
+  const ProductPhotosSheet({
+    super.key,
+    required this.product,
+  });
+
+  @override
+  State<ProductPhotosSheet> createState() => _ProductPhotosSheetState();
+}
+
+class _ProductPhotosSheetState extends State<ProductPhotosSheet> {
+  bool loading = true;
+  String? error;
+  List<String> urls = [];
+
+  @override
+  void initState() {
+    super.initState();
+    loadPhotos();
+  }
+
+  Future<void> loadPhotos() async {
+    final barcode = widget.product['barcode']?.toString().trim() ?? '';
+    if (barcode.isEmpty) {
+      if (mounted) {
+        setState(() {
+          loading = false;
+          error = 'У товара нет штрихкода';
+        });
+      }
+      return;
+    }
+
+    try {
+      final storage = Supabase.instance.client.storage.from('product-photos');
+      final files = await storage.list(path: barcode);
+      final imageFiles = files
+          .where((file) => file.name.isNotEmpty)
+          .toList()
+        ..sort((a, b) => b.name.compareTo(a.name));
+
+      final signedUrls = <String>[];
+      for (final file in imageFiles) {
+        final path = '$barcode/${file.name}';
+        final url = await storage.createSignedUrl(path, 3600);
+        signedUrls.add(url);
+      }
+
+      if (!mounted) return;
+      setState(() {
+        urls = signedUrls;
+        loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        loading = false;
+        error = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final name = widget.product['name']?.toString() ?? 'Товар';
+    final barcode = widget.product['barcode']?.toString() ?? '';
+
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(18, 18, 18, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.photo_library_outlined),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    name,
+                    style: const TextStyle(
+                      fontSize: 21,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  onPressed: () => Navigator.pop(context),
+                  icon: const Icon(Icons.close),
+                ),
+              ],
+            ),
+            Text(
+              'Штрихкод: $barcode',
+              style: const TextStyle(color: Colors.white60),
+            ),
+            const SizedBox(height: 16),
+            if (loading)
+              const SizedBox(
+                height: 180,
+                child: Center(child: CircularProgressIndicator()),
+              )
+            else if (error != null)
+              SizedBox(
+                height: 180,
+                child: Center(
+                  child: Text(
+                    'Не удалось загрузить фото.\n$error',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              )
+            else if (urls.isEmpty)
+              const SizedBox(
+                height: 180,
+                child: Center(
+                  child: Text(
+                    'Фотографий у товара пока нет.',
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              )
+            else
+              SizedBox(
+                height: 330,
+                child: PageView.builder(
+                  itemCount: urls.length,
+                  itemBuilder: (_, index) => Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(18),
+                      child: InteractiveViewer(
+                        minScale: 0.8,
+                        maxScale: 4,
+                        child: Image.network(
+                          urls[index],
+                          fit: BoxFit.contain,
+                          loadingBuilder: (context, child, progress) {
+                            if (progress == null) return child;
+                            return const Center(
+                              child: CircularProgressIndicator(),
+                            );
+                          },
+                          errorBuilder: (_, _, _) => const Center(
+                            child: Icon(
+                              Icons.broken_image_outlined,
+                              size: 56,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            if (urls.length > 1) ...[
+              const SizedBox(height: 10),
+              Center(
+                child: Text(
+                  'Фотографий: ${urls.length} • листайте влево/вправо',
+                  style: const TextStyle(color: Colors.white60),
+                ),
+              ),
+            ],
+          ],
+        ),
       ),
     );
   }
@@ -1908,6 +2694,48 @@ class _ProductFormState extends State<ProductForm> {
         SnackBar(content: Text('Не удалось сделать фото: $e')),
       );
     }
+  }
+
+  Future<List<String>> uploadPhotosToSupabase(
+    String productBarcode,
+  ) async {
+    if (photos.isEmpty) return [];
+
+    final storage =
+        Supabase.instance.client.storage.from('product-photos');
+    final uploadedPaths = <String>[];
+
+    for (var i = 0; i < photos.length; i++) {
+      final source = File(photos[i].path);
+      if (!await source.exists()) {
+        throw Exception('Файл фотографии не найден');
+      }
+
+      final extension = p.extension(photos[i].path).toLowerCase();
+      final safeExtension = extension.isEmpty ? '.jpg' : extension;
+      final contentType = safeExtension == '.png'
+          ? 'image/png'
+          : safeExtension == '.webp'
+              ? 'image/webp'
+              : 'image/jpeg';
+
+      final path =
+          '$productBarcode/${DateTime.now().microsecondsSinceEpoch}_$i$safeExtension';
+
+      await storage.upload(
+        path,
+        source,
+        fileOptions: FileOptions(
+          cacheControl: '31536000',
+          contentType: contentType,
+          upsert: false,
+        ),
+      );
+
+      uploadedPaths.add(path);
+    }
+
+    return uploadedPaths;
   }
 
   Future<List<String>> savePhotosLocally() async {
@@ -1989,32 +2817,41 @@ class _ProductFormState extends State<ProductForm> {
 
       if (!isNew) {
         data['id'] = widget.product!['id'];
+        data['server_id'] = widget.product!['server_id'];
       }
 
       await DB.i.saveProduct(data);
 
-      if (isNew && stock > 0 && photos.isNotEmpty) {
-        final productRow = await DB.i.product(productBarcode);
-        if (productRow != null) {
-          final paths = await savePhotosLocally();
+      var uploadedPhotoCount = 0;
+      if (photos.isNotEmpty) {
+        final uploadedPaths = await uploadPhotosToSupabase(productBarcode);
+        uploadedPhotoCount = uploadedPaths.length;
 
-          await DB.i.createPurchaseReport(
-            productId: productRow['id'] as int,
-            seller: widget.user['username'].toString(),
-            quantity: stock,
-            purchasePrice: buyPrice,
-            photoPaths: paths,
-          );
+        // Локальная копия остаётся для существующей истории закупок.
+        if (isNew && stock > 0) {
+          final productRow = await DB.i.product(productBarcode);
+          if (productRow != null) {
+            final localPaths = await savePhotosLocally();
+            await DB.i.createPurchaseReport(
+              productId: productRow['id'] as int,
+              seller: widget.user['username'].toString(),
+              quantity: stock,
+              purchasePrice: buyPrice,
+              photoPaths: localPaths,
+            );
+          }
         }
       }
 
       if (!mounted) return;
 
-      if (isNew && stock > 0 && photos.isNotEmpty) {
+      if (uploadedPhotoCount > 0) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Товар добавлен. Фото приёмки: ${photos.length}',
+              isNew
+                  ? 'Товар добавлен. Фото загружено: $uploadedPhotoCount'
+                  : 'Товар сохранён. Фото загружено: $uploadedPhotoCount',
             ),
           ),
         );
@@ -2125,8 +2962,8 @@ class _ProductFormState extends State<ProductForm> {
               Align(
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  'Фото сохраняются вместе с отчётом о поступлении. '
-                  'Позже подключим загрузку на сервер.',
+                  'Фото сохраняются в защищённое хранилище Supabase и '
+                  'привязываются к штрихкоду товара.',
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
               ),
@@ -3095,11 +3932,13 @@ class _MiniStat extends StatelessWidget {
 class More extends StatelessWidget {
   final Map<String, dynamic> user;
   final VoidCallback logout;
+  final Future<void> Function()? onRefreshPermissions;
 
   const More({
     super.key,
     required this.user,
     required this.logout,
+    this.onRefreshPermissions,
   });
 
   @override
@@ -3129,6 +3968,20 @@ class More extends StatelessWidget {
               ),
             ),
           ),
+          if (onRefreshPermissions != null)
+            MoreAction(
+              title: 'Обновить права доступа',
+              icon: Icons.sync,
+              onTap: () async {
+                await onRefreshPermissions!();
+                if (!context.mounted) return;
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Права доступа обновлены'),
+                  ),
+                );
+              },
+            ),
           if (hasPermission(user, 'shift'))
             MoreAction(
               title: 'Кассовая смена',
@@ -3241,23 +4094,141 @@ class More extends StatelessWidget {
             ),
           if (hasPermission(user, 'backup'))
             MoreAction(
+              title: 'Восстановить из резервной копии',
+              icon: Icons.restore,
+              onTap: () async {
+                try {
+                  final result = await FilePicker.platform.pickFiles(
+                    type: FileType.custom,
+                    allowedExtensions: ['json'],
+                    withData: false,
+                  );
+
+                  if (result == null || result.files.isEmpty) return;
+
+                  final path = result.files.single.path;
+                  if (path == null || path.isEmpty) {
+                    throw Exception('Не удалось получить путь к файлу');
+                  }
+
+                  final raw = await File(path).readAsString();
+                  final decoded = jsonDecode(raw);
+
+                  if (decoded is! Map) {
+                    throw Exception(
+                      'Файл резервной копии имеет неверный формат',
+                    );
+                  }
+
+                  final backupData = Map<String, dynamic>.from(decoded);
+
+                  if ((backupData['backup_version'] as num?)?.toInt() != 1) {
+                    throw Exception(
+                      'Неподдерживаемая версия резервной копии',
+                    );
+                  }
+
+                  final products = backupData['products'] is List
+                      ? (backupData['products'] as List).length
+                      : 0;
+                  final receipts = backupData['receipts'] is List
+                      ? (backupData['receipts'] as List).length
+                      : 0;
+                  final operations = backupData['operations'] is List
+                      ? (backupData['operations'] as List).length
+                      : 0;
+
+                  if (!context.mounted) return;
+
+                  final confirmed = await showDialog<bool>(
+                    context: context,
+                    builder: (dialogContext) {
+                      return AlertDialog(
+                        title: const Text('Восстановить резервную копию?'),
+                        content: Text(
+                          'В копии найдено:\n\n'
+                          'Товаров: $products\n'
+                          'Чеков: $receipts\n'
+                          'Операций: $operations\n\n'
+                          'Текущие рабочие данные на сервере будут '
+                          'заменены данными из этой копии.\n\n'
+                          'Пользователи и их аккаунты не изменятся.',
+                        ),
+                        actions: [
+                          TextButton(
+                            onPressed: () =>
+                                Navigator.pop(dialogContext, false),
+                            child: const Text('Отмена'),
+                          ),
+                          FilledButton(
+                            onPressed: () =>
+                                Navigator.pop(dialogContext, true),
+                            child: const Text('Восстановить'),
+                          ),
+                        ],
+                      );
+                    },
+                  );
+
+                  if (confirmed != true || !context.mounted) return;
+
+                  await DB.i.restoreBackupFromFile(path);
+
+                  if (!context.mounted) return;
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Резервная копия успешно восстановлена',
+                      ),
+                    ),
+                  );
+                } catch (error) {
+                  if (!context.mounted) return;
+
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        'Не удалось восстановить копию: $error',
+                      ),
+                    ),
+                  );
+                }
+              },
+            ),
+          if (hasPermission(user, 'backup'))
+            MoreAction(
               title: 'Резервная копия',
-            icon: Icons.backup,
-            onTap: () async {
-              await DB.i.backup();
+              icon: Icons.backup,
+              onTap: () async {
+                try {
+                  final savedPath = await DB.i.backup();
 
-              if (!context.mounted) return;
+                  if (!context.mounted) return;
+                  if (savedPath == null || savedPath.isEmpty) return;
 
-              ScaffoldMessenger.of(context)
-                  .showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'Резервная копия создана',
-                  ),
-                ),
-              );
-            },
-          ),
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        'Резервная копия сохранена: ${p.basename(savedPath)}',
+                      ),
+                    ),
+                  );
+                } catch (error) {
+                  if (!context.mounted) return;
+
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        'Не удалось создать резервную копию: $error',
+                      ),
+                    ),
+                  );
+                }
+              },
+            ),
           if (user['role'] == 'admin')
             MoreAction(
               title: 'Очистить все рабочие данные',
@@ -4681,6 +5652,64 @@ class _PurchasePageState extends State<PurchasePage> {
     return paths;
   }
 
+  Future<List<String>> uploadPurchasePhotosToSupabase(String productBarcode) async {
+    if (photos.isEmpty) return [];
+
+    final storage = Supabase.instance.client.storage.from('product-photos');
+    final uploadedPaths = <String>[];
+    final batchId = DateTime.now().microsecondsSinceEpoch;
+
+    try {
+      for (var i = 0; i < photos.length; i++) {
+        final source = File(photos[i].path);
+        if (!await source.exists()) {
+          throw Exception('Файл фотографии не найден');
+        }
+
+        final extension = p.extension(photos[i].path).toLowerCase();
+        final safeExtension = extension.isEmpty ? '.jpg' : extension;
+        final contentType = safeExtension == '.png'
+            ? 'image/png'
+            : safeExtension == '.webp'
+                ? 'image/webp'
+                : 'image/jpeg';
+
+        // Фото закупки кладём в папку штрихкода. Поэтому администратор
+        // увидит их вместе с остальными фото этого товара.
+        final path = '$productBarcode/purchase_${batchId}_$i$safeExtension';
+
+        await storage.upload(
+          path,
+          source,
+          fileOptions: FileOptions(
+            cacheControl: '31536000',
+            contentType: contentType,
+            upsert: false,
+          ),
+        );
+
+        uploadedPaths.add(path);
+      }
+
+      return uploadedPaths;
+    } catch (e) {
+      if (uploadedPaths.isNotEmpty) {
+        try {
+          await storage.remove(uploadedPaths);
+        } catch (_) {
+          // Не скрываем исходную ошибку загрузки.
+        }
+      }
+      rethrow;
+    }
+  }
+
+  Future<void> deletePurchasePhotosFromSupabase(List<String> paths) async {
+    if (paths.isEmpty) return;
+    final storage = Supabase.instance.client.storage.from('product-photos');
+    await storage.remove(paths);
+  }
+
   Future<void> save() async {
     final pdt = product;
     if (pdt == null || saving) return;
@@ -4694,21 +5723,44 @@ class _PurchasePageState extends State<PurchasePage> {
     }
 
     setState(() => saving = true);
+    List<String> uploadedPaths = [];
+
     try {
-      final paths = await savePhotosLocally();
+      final localPaths = await savePhotosLocally();
+      final productBarcode = pdt['barcode']?.toString().trim() ?? '';
+      if (productBarcode.isEmpty) {
+        throw Exception('У товара нет штрихкода');
+      }
+
+      // Сначала загружаем фото в защищённое хранилище Supabase.
+      uploadedPaths = await uploadPurchasePhotosToSupabase(productBarcode);
+
       await DB.i.purchase(
         pdt['id'] as int,
         count,
         price,
         widget.user['username'].toString(),
-        photoPaths: paths,
+        photoPaths: localPaths,
       );
+
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Закупка добавлена. Фото: ${paths.length}')),
+        SnackBar(
+          content: Text(
+            'Закупка добавлена. Фото загружено: ${uploadedPaths.length}',
+          ),
+        ),
       );
       Navigator.pop(context);
     } catch (e) {
+      // Если закупка не сохранилась локально, удаляем уже загруженные
+      // серверные фотографии, чтобы не оставлять мусор в Storage.
+      if (uploadedPaths.isNotEmpty) {
+        try {
+          await deletePurchasePhotosFromSupabase(uploadedPaths);
+        } catch (_) {}
+      }
+
       if (!mounted) return;
       setState(() => saving = false);
       ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
@@ -4786,7 +5838,7 @@ class _PurchasePageState extends State<PurchasePage> {
                   children: [
                     const Text('Фотоотчёт', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w900)),
                     const SizedBox(height: 6),
-                    const Text('Сфотографируйте товар или поставку. Фото пока сохраняются на телефоне; сервер подключим следующим этапом.'),
+                    const Text('Сфотографируйте товар или поставку. Фото сохраняются в защищённом хранилище Supabase и привязываются к штрихкоду товара.'),
                     const SizedBox(height: 12),
                     if (photos.isNotEmpty)
                       SizedBox(
@@ -5052,78 +6104,231 @@ class _UserFormState extends State<UserForm> {
     password.dispose();
     super.dispose();
   }
+Future<void> save() async {
+  print('SELLER SAVE BUTTON PRESSED');
 
-  Future<void> save() async {
-    final username = login.text.trim();
-    final fullName = name.text.trim();
+  final username = login.text.trim();
+  final fullName = name.text.trim();
 
-    if (username.isEmpty || fullName.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Заполните логин и имя',
-          ),
-        ),
-      );
-      return;
-    }
-
-    if (widget.user == null &&
-        password.text.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Для нового продавца нужен пароль',
-          ),
-        ),
-      );
-      return;
-    }
-
-    final data = <String, dynamic>{
-      'username': username,
-      'full_name': fullName,
-      'active': active ? 1 : 0,
-    };
-
-    if (widget.user == null) {
-      data['password_hash'] =
-          hashPassword(password.text);
-      data['role'] = 'seller';
-      data['permissions'] = jsonEncode(permissions);
-      data['created_at'] =
-          DateTime.now().toIso8601String();
-    } else {
-      data['id'] = widget.user!['id'];
-      if (widget.user!['role']?.toString() != 'admin') {
-        data['permissions'] = jsonEncode(permissions);
-      }
-
-      if (password.text.isNotEmpty) {
-        data['password_hash'] =
-            hashPassword(password.text);
-      }
-    }
-
-    try {
-      await DB.i.saveUser(data);
-
-      if (!mounted) return;
-      Navigator.pop(context);
-    } catch (error) {
-      if (!mounted) return;
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            'Не удалось сохранить: $error',
-          ),
-        ),
-      );
-    }
+  if (username.isEmpty || fullName.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Заполните email и имя'),
+      ),
+    );
+    return;
   }
 
-  @override
+  if (widget.user == null && password.text.isEmpty) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Для нового продавца нужен пароль'),
+      ),
+    );
+    return;
+  }
+
+  if (widget.user == null && password.text.length < 6) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Пароль должен содержать минимум 6 символов',
+        ),
+      ),
+    );
+    return;
+  }
+
+  try {
+    // =========================================================
+    // СОЗДАНИЕ НОВОГО ПРОДАВЦА
+    // =========================================================
+
+    if (widget.user == null) {
+      print('CREATE SELLER: отправляем запрос');
+
+      final session =
+          Supabase.instance.client.auth.currentSession;
+
+      if (session == null || session.accessToken.isEmpty) {
+        throw Exception('Нет активной сессии Supabase');
+      }
+
+      print('JWT найден, отправляем его в create-seller');
+
+      final response =
+          await Supabase.instance.client.functions.invoke(
+        'create-seller',
+        headers: {
+          'Authorization':
+              'Bearer ${session.accessToken}',
+        },
+        body: {
+          'email': username,
+          'full_name': fullName,
+          'password': password.text,
+          'permissions': permissions,
+        },
+      );
+
+      print('FUNCTION STATUS: ${response.status}');
+      print('FUNCTION DATA: ${response.data}');
+
+      final responseData = response.data;
+
+      if (responseData is Map &&
+          responseData['success'] == true) {
+        // Сохраняем локальный кэш только после
+        // успешного создания на сервере.
+        await DB.i.saveUser({
+          'username': username,
+          'password_hash': '',
+          'role': 'seller',
+          'full_name': fullName,
+          'active': active ? 1 : 0,
+          'permissions': jsonEncode(permissions),
+          'created_at':
+              DateTime.now().toIso8601String(),
+        });
+
+        if (!mounted) return;
+
+        Navigator.pop(context);
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Продавец создан на сервере',
+            ),
+          ),
+        );
+
+        return;
+      }
+
+      final errorMessage =
+          responseData is Map
+              ? responseData['error']?.toString()
+              : null;
+
+      throw Exception(
+        errorMessage ??
+            'Не удалось создать продавца',
+      );
+    }
+
+    // =========================================================
+    // РЕДАКТИРОВАНИЕ СУЩЕСТВУЮЩЕГО ПРОДАВЦА
+    // =========================================================
+
+    final oldEmail =
+        widget.user!['username']
+            ?.toString()
+            .trim()
+            .toLowerCase() ??
+        '';
+
+    if (oldEmail.isEmpty) {
+      throw Exception(
+        'Не найден текущий email продавца',
+      );
+    }
+
+    print('UPDATE SELLER: отправляем запрос');
+
+    final session =
+        Supabase.instance.client.auth.currentSession;
+
+    if (session == null || session.accessToken.isEmpty) {
+      throw Exception(
+        'Нет активной сессии Supabase',
+      );
+    }
+
+    print('JWT найден, отправляем его в update-seller');
+
+    final response =
+        await Supabase.instance.client.functions.invoke(
+      'update-seller',
+      headers: {
+        'Authorization':
+            'Bearer ${session.accessToken}',
+      },
+      body: {
+        'old_email': oldEmail,
+        'email': username,
+        'full_name': fullName,
+        'active': active,
+        'permissions': permissions,
+        if (password.text.isNotEmpty)
+          'password': password.text,
+      },
+    );
+
+    print(
+      'UPDATE SELLER STATUS: ${response.status}',
+    );
+
+    print(
+      'UPDATE SELLER DATA: ${response.data}',
+    );
+
+    final responseData = response.data;
+
+    if (responseData is! Map ||
+        responseData['success'] != true) {
+      final errorMessage =
+          responseData is Map
+              ? responseData['error']?.toString()
+              : null;
+
+      throw Exception(
+        errorMessage ??
+            'Не удалось обновить продавца',
+      );
+    }
+
+    // =========================================================
+    // ОБНОВЛЯЕМ ЛОКАЛЬНЫЙ КЭШ
+    // ТОЛЬКО ПОСЛЕ УСПЕШНОГО СЕРВЕРА
+    // =========================================================
+
+    await DB.i.saveUser({
+      'id': widget.user!['id'],
+      'username': username,
+      'password_hash': '',
+      'role': 'seller',
+      'full_name': fullName,
+      'active': active ? 1 : 0,
+      'permissions': jsonEncode(permissions),
+    });
+
+    if (!mounted) return;
+
+    Navigator.pop(context);
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text(
+          'Продавец обновлен на сервере',
+        ),
+      ),
+    );
+  } catch (error) {
+    print('SELLER SAVE ERROR: $error');
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          'Не удалось сохранить: $error',
+        ),
+      ),
+    );
+  }
+}
+ @override
   Widget build(BuildContext context) {
     return Padding(
       padding: EdgeInsets.fromLTRB(
@@ -5149,9 +6354,9 @@ class _UserFormState extends State<UserForm> {
             TextField(
               controller: login,
               decoration: const InputDecoration(
-                labelText: 'Логин',
-                prefixIcon: Icon(Icons.person),
-              ),
+  labelText: 'Email',
+  prefixIcon: Icon(Icons.email),
+),
             ),
             const SizedBox(height: 10),
             TextField(
