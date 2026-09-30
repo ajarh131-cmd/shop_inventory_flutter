@@ -60,6 +60,7 @@ const sellerPermissionDefaults = <String, bool>{
   'receipts': true,
   'backup': false,
   'purchases': false,
+  'purchase_photos': false,
   'product_history': true,
 };
 
@@ -77,6 +78,7 @@ const permissionLabels = <String, String>{
   'backup': 'Резервная копия',
   'purchases': 'Закупки и пополнение товара',
   'product_history': 'История товара',
+  'purchase_photos': 'Фото приёмки',
 };
 
 Map<String, bool> decodePermissions(Object? raw) {
@@ -130,6 +132,7 @@ class DB {
 
   static final DB i = DB._();
   Database? db;
+  int? currentShopId;
 
   Future<Database> open() async {
     if (db != null) return db!;
@@ -205,6 +208,19 @@ class DB {
       'permissions',
       "TEXT DEFAULT ''",
     );
+    await _ensureColumn(
+      database,
+      'users',
+      'shop_id',
+      'INTEGER',
+    );
+
+    await database.execute("""
+      CREATE TABLE IF NOT EXISTS app_meta(
+        key TEXT PRIMARY KEY,
+        value TEXT
+      )
+    """);
 
     final sellersWithoutPermissions = await database.query(
       'users',
@@ -359,7 +375,22 @@ class DB {
     }
 
     final result = Map<String, dynamic>.from(profile);
-    print('LOGIN PROFILE: ${result['username']} permissions=${result['permissions']}');
+
+    currentShopId = (result['shop_id'] as num?)?.toInt();
+
+    if (currentShopId == null) {
+      await Supabase.instance.client.auth.signOut();
+      return null;
+    }
+
+    await _prepareLocalShop(currentShopId!);
+
+    print(
+      'LOGIN PROFILE: ${result['username']} '
+      'shop_id=$currentShopId '
+      'permissions=${result['permissions']}',
+    );
+
     return result;
   } catch (e) {
     print('LOGIN ERROR: $e');
@@ -373,11 +404,56 @@ class DB {
   // ТОВАРЫ: SUPABASE + ЛОКАЛЬНЫЙ КЭШ
   // =========================
 
+  int _requireShopId() {
+    final id = currentShopId;
+    if (id == null) {
+      throw Exception('Магазин пользователя не определён');
+    }
+    return id;
+  }
+
+  Future<void> _prepareLocalShop(int shopId) async {
+    final meta = await db!.query(
+      'app_meta',
+      columns: ['value'],
+      where: 'key = ?',
+      whereArgs: ['current_shop_id'],
+      limit: 1,
+    );
+
+    final oldShopId = meta.isEmpty ? null : int.tryParse(meta.first['value']?.toString() ?? '');
+
+    if (oldShopId != null && oldShopId != shopId) {
+      await db!.transaction((txn) async {
+        await txn.delete('receipt_items');
+        await txn.delete('receipts');
+        await txn.delete('operations');
+        await txn.delete('purchase_photos');
+        await txn.delete('purchase_reports');
+        await txn.delete('shifts');
+        await txn.delete('products');
+      });
+    }
+
+    await db!.insert(
+      'app_meta',
+      {'key': 'current_shop_id', 'value': '$shopId'},
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
   Future<List<Map<String, dynamic>>> serverProducts() async {
-    final data = await Supabase.instance.client
-        .from('products')
-        .select()
-        .order('name');
+    final shopId = currentShopId;
+
+if (shopId == null) {
+  throw Exception('Магазин пользователя не определён');
+}
+
+final data = await Supabase.instance.client
+    .from('products')
+    .select()
+    .eq('shop_id', shopId)
+    .order('name');
 
     return List<Map<String, dynamic>>.from(
       data.map((row) => Map<String, dynamic>.from(row)),
@@ -479,11 +555,18 @@ class DB {
     if (code.isEmpty) return null;
 
     try {
-      final data = await Supabase.instance.client
-          .from('products')
-          .select()
-          .eq('barcode', code)
-          .maybeSingle();
+      final shopId = currentShopId;
+
+if (shopId == null) {
+  throw Exception('Магазин пользователя не определён');
+}
+
+final data = await Supabase.instance.client
+    .from('products')
+    .select()
+    .eq('barcode', code)
+    .eq('shop_id', shopId)
+    .maybeSingle();;
 
       if (data != null) {
         await cacheServerProducts([Map<String, dynamic>.from(data)]);
@@ -508,14 +591,21 @@ class DB {
       throw Exception('Штрихкод не может быть пустым');
     }
 
-    final data = <String, dynamic>{
-      'barcode': barcode,
-      'name': product['name']?.toString().trim() ?? '',
-      'price': (product['price'] as num?)?.toDouble() ?? 0,
-      'quantity': (product['quantity'] as num?)?.toInt() ?? 0,
-      'purchase_price':
-          (product['purchase_price'] as num?)?.toDouble() ?? 0,
-    };
+    final shopId = currentShopId;
+
+if (shopId == null) {
+  throw Exception('Магазин пользователя не определён');
+}
+
+final data = <String, dynamic>{
+  'barcode': barcode,
+  'name': product['name']?.toString().trim() ?? '',
+  'price': (product['price'] as num?)?.toDouble() ?? 0,
+  'quantity': (product['quantity'] as num?)?.toInt() ?? 0,
+  'purchase_price':
+      (product['purchase_price'] as num?)?.toDouble() ?? 0,
+  'shop_id': shopId,
+};
 
     final serverId = (product['server_id'] as num?)?.toInt();
     final localId = (product['id'] as num?)?.toInt();
@@ -574,6 +664,53 @@ class DB {
         whereArgs: [localId],
       );
     }
+  }
+
+  Future<void> _recordPurchaseReportOnSupabase({
+    required String barcode,
+    required int quantity,
+    required double purchasePrice,
+    required String seller,
+  }) async {
+    await Supabase.instance.client.rpc(
+      'record_purchase_report',
+      params: {
+        'p_barcode': barcode,
+        'p_quantity': quantity,
+        'p_purchase_price': purchasePrice,
+        'p_seller': seller,
+      },
+    );
+  }
+
+  Future<void> _recordInitialProductInvestmentOnSupabase({
+    required String barcode,
+    required int quantity,
+    required double purchasePrice,
+    required String seller,
+  }) async {
+    await Supabase.instance.client.rpc(
+      'record_initial_product_investment',
+      params: {
+        'p_barcode': barcode,
+        'p_quantity': quantity,
+        'p_purchase_price': purchasePrice,
+        'p_seller': seller,
+      },
+    );
+  }
+
+  Future<double> totalInvestedInProducts() async {
+    final response = await Supabase.instance.client.rpc(
+      'get_shop_investment_total',
+    );
+
+    if (response is num) return response.toDouble();
+
+    final parsed = double.tryParse(response?.toString() ?? '');
+    if (parsed != null) return parsed;
+
+    throw Exception('Сервер не вернул сумму вложений: $response');
   }
 
   Future<int> createPurchaseReport({
@@ -659,11 +796,18 @@ class DB {
   Future<void> _syncSoldProductsToLocalCache(List<CartItem> cart) async {
     for (final item in cart) {
       try {
-        final serverProduct = await Supabase.instance.client
-            .from('products')
-            .select()
-            .eq('barcode', item.code)
-            .maybeSingle();
+        final shopId = currentShopId;
+
+if (shopId == null) {
+  throw Exception('Магазин пользователя не определён');
+}
+
+final serverProduct = await Supabase.instance.client
+    .from('products')
+    .select()
+    .eq('barcode', item.code)
+    .eq('shop_id', shopId)
+    .maybeSingle();
 
         if (serverProduct == null) continue;
 
@@ -764,11 +908,17 @@ class DB {
   }
 
 Future<Map<String, num>> shiftTotals(int shiftId) async {
+  final shopId = currentShopId;
+
+if (shopId == null) {
+  throw Exception('Магазин пользователя не определён');
+}
   // Продажи берём из серверных чеков текущей смены.
   final receiptsResponse = await Supabase.instance.client
       .from('receipts')
       .select('id,total,shift_id')
-      .eq('shift_id', shiftId);
+      .eq('shift_id', shiftId)
+      .eq('shop_id', shopId);
 
   final receipts = (receiptsResponse as List)
       .map((row) => Map<String, dynamic>.from(row as Map))
@@ -790,8 +940,9 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
 
   if (receiptIds.isNotEmpty) {
     final itemsResponse = await Supabase.instance.client
-        .from('receipt_items')
-        .select('receipt_id,quantity');
+    .from('receipt_items')
+    .select('receipt_id,quantity')
+    .eq('shop_id', shopId);
 
     for (final raw in (itemsResponse as List)) {
       final row = Map<String, dynamic>.from(raw as Map);
@@ -806,9 +957,10 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
   double returns = 0;
 
   final operationsResponse = await Supabase.instance.client
-      .from('operations')
-      .select('operation_type,total,quantity,shift_id')
-      .eq('shift_id', shiftId);
+    .from('operations')
+    .select('operation_type,total,quantity,shift_id')
+    .eq('shift_id', shiftId)
+    .eq('shop_id', shopId);
 
   for (final raw in (operationsResponse as List)) {
     final row = Map<String, dynamic>.from(raw as Map);
@@ -833,9 +985,11 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
   }) async {
     // Чеки хранятся на сервере Supabase. Локальная SQLite больше
     // не является источником списка чеков.
+    final shopId = _requireShopId();
     var query = Supabase.instance.client
         .from('receipts')
-        .select();
+        .select()
+        .eq('shop_id', shopId);
 
     if (seller.isNotEmpty) {
       query = query.eq('seller', seller);
@@ -883,10 +1037,12 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
   Future<List<Map<String, dynamic>>> receiptItems(
     int receiptId,
   ) async {
+    final shopId = _requireShopId();
     final rows = await Supabase.instance.client
         .from('receipt_items')
         .select()
         .eq('receipt_id', receiptId)
+        .eq('shop_id', shopId)
         .order('id', ascending: true);
 
     return (rows as List)
@@ -897,10 +1053,12 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
   Future<Map<String, dynamic>?> receipt(
     int receiptId,
   ) async {
+    final shopId = _requireShopId();
     final row = await Supabase.instance.client
         .from('receipts')
         .select()
         .eq('id', receiptId)
+        .eq('shop_id', shopId)
         .maybeSingle();
 
     if (row == null) return null;
@@ -1134,6 +1292,31 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
         return id;
       });
 
+      try {
+        await _recordPurchaseReportOnSupabase(
+          barcode: barcode,
+          quantity: quantity,
+          purchasePrice: purchasePrice,
+          seller: seller,
+        );
+      } catch (reportError) {
+        await db!.delete(
+          'purchase_reports',
+          where: 'id = ?',
+          whereArgs: [reportId],
+        );
+
+        await _restorePurchaseOnSupabase(
+          barcode: barcode,
+          quantity: quantity,
+          oldPurchasePrice: oldPurchasePrice,
+        );
+
+        throw Exception(
+          'Не удалось записать закупку на сервере: $reportError',
+        );
+      }
+
       notifyInventoryChanged();
       return reportId;
     } catch (e) {
@@ -1222,10 +1405,12 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
     throw Exception('У товара нет штрихкода');
   }
 
+  final shopId = _requireShopId();
   dynamic query = Supabase.instance.client
       .from('operations')
       .select()
-      .eq('barcode', barcode);
+      .eq('barcode', barcode)
+      .eq('shop_id', shopId);
 
   if (seller.isNotEmpty) {
     query = query.eq('seller', seller);
@@ -1275,9 +1460,12 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
       return !local.isBefore(periodStart) && local.isBefore(periodEnd);
     }
 
+    final shopId = _requireShopId();
+
     final receiptsResponse = await Supabase.instance.client
         .from('receipts')
         .select('id,total,seller,created_at')
+        .eq('shop_id', shopId)
         .order('created_at', ascending: false);
 
     final receipts = (receiptsResponse as List)
@@ -1295,7 +1483,8 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
 
     final itemsResponse = await Supabase.instance.client
         .from('receipt_items')
-        .select('receipt_id,quantity');
+        .select('receipt_id,quantity')
+        .eq('shop_id', shopId);
 
     final soldByReceipt = <int, int>{};
     for (final raw in (itemsResponse as List)) {
@@ -1343,9 +1532,11 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
     String? productName,
     String? operationType,
   }) async {
+    final shopId = _requireShopId();
     dynamic query = Supabase.instance.client
         .from('operations')
-        .select();
+        .select()
+        .eq('shop_id', shopId);
 
     if (seller.isNotEmpty) {
       query = query.eq('seller', seller);
@@ -1403,9 +1594,12 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
       return !local.isBefore(periodStart) && local.isBefore(periodEnd);
     }
 
+    final shopId = _requireShopId();
+
     final receipts = await Supabase.instance.client
         .from('receipts')
         .select('id,total,seller,created_at')
+        .eq('shop_id', shopId)
         .order('id', ascending: false);
 
     final receiptRows = (receipts as List)
@@ -1430,7 +1624,8 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
     if (receiptIds.isNotEmpty) {
       final items = await Supabase.instance.client
           .from('receipt_items')
-          .select('receipt_id,quantity,profit');
+          .select('receipt_id,quantity,profit')
+          .eq('shop_id', shopId);
 
       for (final raw in (items as List)) {
         final row = Map<String, dynamic>.from(raw as Map);
@@ -1448,6 +1643,7 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
     final operations = await Supabase.instance.client
         .from('operations')
         .select('operation_type,total,quantity,seller,created_at')
+        .eq('shop_id', shopId)
         .order('id', ascending: false)
         .limit(1000);
 
@@ -1479,96 +1675,233 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
   Future<List<Map<String, dynamic>>> sellerStats(
     String period,
   ) async {
-    final conditions = <String>[];
-    final args = <Object?>[];
+    final shopId = _requireShopId();
+    DateTime? startDate;
+    DateTime? endDate;
 
-    if (period != 'all') {
-      final now = DateTime.now();
-      late final DateTime start;
-      late final DateTime end;
-
-      if (period == 'today') {
-        start = DateTime(now.year, now.month, now.day);
-        end = start.add(const Duration(days: 1));
-      } else if (period == 'week') {
-        end = DateTime(now.year, now.month, now.day).add(
-          const Duration(days: 1),
-        );
-        start = end.subtract(const Duration(days: 7));
-      } else if (period == 'month') {
-        start = DateTime(now.year, now.month);
-        end = now.month == 12
-            ? DateTime(now.year + 1, 1)
-            : DateTime(now.year, now.month + 1);
-      } else {
-        start = DateTime(2000);
-        end = DateTime(2100);
-      }
-
-      conditions.add('r.created_at >= ? AND r.created_at < ?');
-      args.add(start.toIso8601String());
-      args.add(end.toIso8601String());
+    final now = DateTime.now();
+    if (period == 'today') {
+      startDate = DateTime(now.year, now.month, now.day);
+      endDate = startDate.add(const Duration(days: 1));
+    } else if (period == 'week') {
+      endDate = DateTime(now.year, now.month, now.day).add(const Duration(days: 1));
+      startDate = endDate.subtract(const Duration(days: 7));
+    } else if (period == 'month') {
+      startDate = DateTime(now.year, now.month);
+      endDate = now.month == 12
+          ? DateTime(now.year + 1, 1)
+          : DateTime(now.year, now.month + 1);
     }
 
-    final where = conditions.isEmpty
-        ? ''
-        : ' WHERE ${conditions.join(' AND ')}';
+    dynamic query = Supabase.instance.client
+        .from('receipts')
+        .select('id,seller,total,created_at')
+        .eq('shop_id', shopId);
 
-    return db!.rawQuery(
-      '''
-      SELECT
-        r.seller,
-        COUNT(r.id) AS sales,
-        COALESCE(SUM(it.sold), 0) AS sold,
-        COALESCE(SUM(r.total), 0) AS revenue,
-        COALESCE(SUM(it.profit), 0) AS profit
-      FROM receipts r
-      LEFT JOIN (
-        SELECT
-          receipt_id,
-          SUM(quantity) AS sold,
-          SUM(profit) AS profit
-        FROM receipt_items
-        GROUP BY receipt_id
-      ) it ON it.receipt_id = r.id
-      $where
-      GROUP BY r.seller
-      ORDER BY revenue DESC
-      ''',
-      args,
-    );
+    if (startDate != null) {
+      query = query.gte('created_at', startDate.toUtc().toIso8601String());
+    }
+    if (endDate != null) {
+      query = query.lt('created_at', endDate.toUtc().toIso8601String());
+    }
+
+    final receiptRows = (await query as List)
+        .map((row) => Map<String, dynamic>.from(row as Map))
+        .toList();
+
+    if (receiptRows.isEmpty) return [];
+
+    final receiptIds = receiptRows
+        .map((row) => (row['id'] as num?)?.toInt())
+        .whereType<int>()
+        .toSet();
+
+    final itemsResponse = await Supabase.instance.client
+        .from('receipt_items')
+        .select('receipt_id,quantity,profit')
+        .eq('shop_id', shopId);
+
+    final soldByReceipt = <int, num>{};
+    final profitByReceipt = <int, num>{};
+    for (final raw in (itemsResponse as List)) {
+      final row = Map<String, dynamic>.from(raw as Map);
+      final receiptId = (row['receipt_id'] as num?)?.toInt();
+      if (receiptId == null || !receiptIds.contains(receiptId)) continue;
+      soldByReceipt[receiptId] =
+          (soldByReceipt[receiptId] ?? 0) + ((row['quantity'] as num?) ?? 0);
+      profitByReceipt[receiptId] =
+          (profitByReceipt[receiptId] ?? 0) + ((row['profit'] as num?) ?? 0);
+    }
+
+    final grouped = <String, Map<String, dynamic>>{};
+    for (final receipt in receiptRows) {
+      final seller = receipt['seller']?.toString() ?? '';
+      final row = grouped.putIfAbsent(
+        seller,
+        () => {
+          'seller': seller,
+          'sales': 0,
+          'sold': 0,
+          'revenue': 0.0,
+          'profit': 0.0,
+        },
+      );
+      final id = (receipt['id'] as num?)?.toInt();
+      row['sales'] = (row['sales'] as int) + 1;
+      row['sold'] = (row['sold'] as num) + (id == null ? 0 : (soldByReceipt[id] ?? 0));
+      row['revenue'] = (row['revenue'] as num) + ((receipt['total'] as num?) ?? 0);
+      row['profit'] = (row['profit'] as num) + (id == null ? 0 : (profitByReceipt[id] ?? 0));
+    }
+
+    final result = grouped.values.toList();
+    result.sort((a, b) => (b['revenue'] as num).compareTo(a['revenue'] as num));
+    return result;
   }
 
   Future<List<Map<String, dynamic>>> users() async {
-    return db!.query(
-      'users',
-      orderBy: 'full_name COLLATE NOCASE',
-    );
+    final shopId = _requireShopId();
+    final rows = await Supabase.instance.client
+        .from('users')
+        .select()
+        .eq('shop_id', shopId)
+        .order('full_name');
+
+    final result = <Map<String, dynamic>>[];
+    for (final raw in (rows as List)) {
+      final serverUser = Map<String, dynamic>.from(raw as Map);
+      final username = serverUser['username']?.toString() ?? '';
+      if (username.isEmpty) continue;
+
+      final local = await db!.query(
+        'users',
+        where: 'username = ? AND (shop_id = ? OR shop_id IS NULL)',
+        whereArgs: [username, _requireShopId()],
+        limit: 1,
+      );
+
+      final localData = {
+        'username': username,
+        'password_hash': '',
+        'role': serverUser['role']?.toString() ?? 'seller',
+        'full_name': serverUser['full_name']?.toString() ?? '',
+        'active': serverUser['active'] == true ? 1 : 0,
+        'permissions': jsonEncode(decodePermissions(serverUser['permissions'])),
+        'shop_id': shopId,
+        'created_at': serverUser['created_at']?.toString() ?? DateTime.now().toIso8601String(),
+      };
+
+      if (local.isEmpty) {
+        await db!.insert('users', localData);
+      } else {
+        await db!.update('users', localData, where: 'id = ?', whereArgs: [local.first['id']]);
+      }
+
+      result.add({...serverUser, 'local_id': local.isEmpty ? null : local.first['id']});
+    }
+    return result;
   }
 
   Future<void> saveUser(Map<String, dynamic> user) async {
-    if (user['id'] == null) {
-      await db!.insert('users', user);
+    final data = Map<String, dynamic>.from(user);
+    data.remove('local_id');
+
+    final username = data['username']?.toString() ?? '';
+    final existing = await db!.query(
+      'users',
+      where: 'username = ? AND (shop_id = ? OR shop_id IS NULL)',
+      whereArgs: [username, _requireShopId()],
+      limit: 1,
+    );
+
+    data.remove('id');
+    data['password_hash'] ??= '';
+    data['shop_id'] ??= _requireShopId();
+    data['created_at'] ??= DateTime.now().toIso8601String();
+
+    if (existing.isEmpty) {
+      await db!.insert('users', data);
     } else {
-      await db!.update(
-        'users',
-        user,
-        where: 'id = ?',
-        whereArgs: [user['id']],
-      );
+      await db!.update('users', data, where: 'id = ?', whereArgs: [existing.first['id']]);
     }
   }
 
-  Future<void> clearAllData() async {
-    final database = db!;
+  Future<void> deleteSeller(String username) async {
+    final shopId = _requireShopId();
+    final email = username.trim().toLowerCase();
 
-    final photoRows = await database.query(
+    if (email.isEmpty) {
+      throw Exception('Не найден email продавца');
+    }
+
+    final session = Supabase.instance.client.auth.currentSession;
+    if (session == null || session.accessToken.isEmpty) {
+      throw Exception('Нет активной сессии Supabase');
+    }
+
+    final response = await Supabase.instance.client.functions.invoke(
+      'delete-seller',
+      headers: {
+        'Authorization': 'Bearer ${session.accessToken}',
+      },
+      body: {
+        'email': email,
+        'shop_id': shopId,
+      },
+    );
+
+    final data = response.data;
+    if (data is! Map || data['success'] != true) {
+      final message = data is Map ? data['error']?.toString() : null;
+      throw Exception(message ?? 'Не удалось удалить продавца');
+    }
+
+    await db!.delete(
+      'users',
+      where: 'username = ? AND shop_id = ?',
+      whereArgs: [email, shopId],
+    );
+  }
+
+  Future<void> clearAllData() async {
+    final shopId = _requireShopId();
+    final supabase = Supabase.instance.client;
+
+    // Сначала обязательно очищаем рабочие данные на сервере.
+    // Если сервер не подтвердил очистку — локальные данные не трогаем
+    // и не показываем пользователю ложное сообщение об успехе.
+    final response = await supabase.rpc(
+      'clear_shop_working_data',
+      params: {
+        'p_shop_id': shopId,
+      },
+    );
+
+    if (response is! Map || response['success'] != true) {
+      throw Exception(
+        'Сервер не подтвердил очистку рабочих данных: $response',
+      );
+    }
+
+    // Дополнительная проверка: товаров магазина на сервере быть не должно.
+    final serverProducts = await supabase
+        .from('products')
+        .select('id')
+        .eq('shop_id', shopId);
+
+    if ((serverProducts as List).isNotEmpty) {
+      throw Exception(
+        'Сервер сообщил об очистке, но товары всё ещё существуют. '
+        'Локальные данные не очищены.',
+      );
+    }
+
+    final photoRows = await db!.query(
       'purchase_photos',
       columns: ['file_path'],
     );
 
-    await database.transaction((txn) async {
-      // Рабочие данные удаляем полностью, пользователей оставляем.
+    // Только после успешной серверной очистки очищаем локальную SQLite.
+    await db!.transaction((txn) async {
       await txn.delete('receipt_items');
       await txn.delete('receipts');
       await txn.delete('operations');
@@ -1577,7 +1910,6 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
       await txn.delete('shifts');
       await txn.delete('products');
 
-      // Начинаем нумерацию заново после очистки тестовых данных.
       await txn.rawDelete(
         "DELETE FROM sqlite_sequence WHERE name IN "
         "('receipt_items', 'receipts', 'operations', "
@@ -1596,7 +1928,8 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
           await file.delete();
         }
       } catch (_) {
-        // База уже очищена; отсутствие одного файла не должно мешать очистке.
+        // База уже очищена; отсутствие одного файла не должно
+        // отменять успешную очистку.
       }
     }
 
@@ -1671,7 +2004,7 @@ Future<Map<String, num>> shiftTotals(int shiftId) async {
 
     final profile = await client
         .from('users')
-        .select('role, active')
+        .select('role, active, shop_id')
         .eq('auth_user_id', authUser.id)
         .maybeSingle();
 
@@ -1794,8 +2127,10 @@ class _AppState extends State<App> {
             )
           : Shell(
               user: user!,
-              logout: () {
-                setState(() => user = null);
+              logout: () async {
+                await Supabase.instance.client.auth.signOut();
+                DB.i.currentShopId = null;
+                if (mounted) setState(() => user = null);
               },
             ),
     );
@@ -1986,8 +2321,14 @@ class _ShellState extends State<Shell> with WidgetsBindingObserver {
 
       if (!mounted || profile == null) return;
 
+      final updatedUser = Map<String, dynamic>.from(profile);
+      final shopId = (updatedUser['shop_id'] as num?)?.toInt();
+      if (shopId == null) throw Exception('Магазин пользователя не определён');
+      DB.i.currentShopId = shopId;
+
+      if (!mounted) return;
       setState(() {
-        currentUser = Map<String, dynamic>.from(profile);
+        currentUser = updatedUser;
       });
     } catch (e) {
       print('PERMISSIONS REFRESH ERROR: $e');
@@ -2068,6 +2409,7 @@ class _HomeState extends State<Home> {
   Map<String, num> statistics = {};
   int productsCount = 0;
   int stockCount = 0;
+  double stockCost = 0;
 
   @override
   void initState() {
@@ -2105,7 +2447,22 @@ class _HomeState extends State<Home> {
         (sum, item) =>
             sum + (item['quantity'] as num).toInt(),
       );
+      stockCost = 0;
     });
+
+    // «Вложено в товар» = сумма всех закупок за всё время.
+    // Продажи и текущий остаток эту сумму не уменьшают.
+    if (widget.user['role']?.toString() == 'admin') {
+      try {
+        final invested = await DB.i.totalInvestedInProducts();
+        if (!mounted) return;
+        setState(() {
+          stockCost = invested;
+        });
+      } catch (error) {
+        print('INVESTMENT TOTAL ERROR: $error');
+      }
+    }
   }
 
   @override
@@ -2156,6 +2513,12 @@ class _HomeState extends State<Home> {
                 title: 'Прибыль',
                 value: money(statistics['profit'] ?? 0),
                 icon: Icons.trending_up,
+              ),
+            if (widget.user['role']?.toString() == 'admin')
+              StatCard(
+                title: 'Вложено в товар',
+                value: money(stockCost),
+                icon: Icons.account_balance_wallet,
               ),
             StatCard(
               title: 'Продано',
@@ -2448,6 +2811,167 @@ Future<void> showProductPhotos(
   );
 }
 
+class PurchasePhotosPage extends StatefulWidget {
+  const PurchasePhotosPage({super.key});
+
+  @override
+  State<PurchasePhotosPage> createState() => _PurchasePhotosPageState();
+}
+
+class _PurchasePhotosPageState extends State<PurchasePhotosPage> {
+  bool loading = true;
+  String? error;
+  List<Map<String, dynamic>> products = [];
+
+  @override
+  void initState() {
+    super.initState();
+    loadProductsWithPhotos();
+  }
+
+  Future<void> loadProductsWithPhotos() async {
+    try {
+      final storage =
+          Supabase.instance.client.storage.from('product-photos');
+
+      final shopId = DB.i._requireShopId();
+      final shopFolder = 'shop_$shopId';
+      final folders = await storage.list(path: shopFolder);
+
+      final result = <Map<String, dynamic>>[];
+      final productRows = await Supabase.instance.client
+          .from('products')
+          .select('barcode,name')
+          .eq('shop_id', shopId);
+
+final namesByBarcode = <String, String>{};
+
+for (final raw in productRows as List) {
+  final row = Map<String, dynamic>.from(raw as Map);
+
+  final barcode = row['barcode']?.toString().trim() ?? '';
+  final name = row['name']?.toString().trim() ?? '';
+
+  if (barcode.isNotEmpty) {
+    namesByBarcode[barcode] = name.isEmpty ? 'Товар' : name;
+  }
+}
+
+      for (final folder in folders) {
+        final barcode = folder.name.trim();
+
+        if (barcode.isEmpty) continue;
+
+        final files = await storage.list(path: '$shopFolder/$barcode');
+
+        final photos = files
+            .where((file) => file.name.isNotEmpty)
+            .toList();
+
+        if (photos.isEmpty) continue;
+
+        result.add({
+          'barcode': barcode,
+          'name': namesByBarcode[barcode] ?? 'Товар',
+          'photoCount': photos.length,
+        });
+      }
+
+      if (!mounted) return;
+
+      setState(() {
+        products = result;
+        loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+
+      setState(() {
+        loading = false;
+        error = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Фото приёмки'),
+      ),
+      body: RefreshIndicator(
+        onRefresh: loadProductsWithPhotos,
+        child: loading
+            ? const Center(
+                child: CircularProgressIndicator(),
+              )
+            : error != null
+                ? ListView(
+                    children: [
+                      const SizedBox(height: 100),
+                      Center(
+                        child: Text(
+                          'Не удалось загрузить фотографии.\n$error',
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ],
+                  )
+                : products.isEmpty
+                    ? ListView(
+                        children: const [
+                          SizedBox(height: 100),
+                          Center(
+                            child: Text(
+                              'Фотографий приёмки пока нет.',
+                            ),
+                          ),
+                        ],
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.all(12),
+                        itemCount: products.length,
+                        itemBuilder: (_, index) {
+                          final product = products[index];
+
+                          return Card(
+                            child: ListTile(
+                              leading: const CircleAvatar(
+                                child: Icon(
+                                  Icons.photo_library,
+                                ),
+                              ),
+                              title: Text(
+                                product['name']?.toString() ?? 'Товар',
+                                style: const TextStyle(
+                                  fontWeight: FontWeight.w800,
+                                ),
+                              ),
+                              subtitle: Text(
+                                '${product['barcode']} • '
+                                '${product['photoCount']} фото',
+                              ),
+                              trailing: const Icon(
+                                Icons.chevron_right,
+                              ),
+                                                           onTap: () {
+                                showProductPhotos(
+                                  context,
+                                  {
+                                    'name': product['name']?.toString() ?? 'Товар',
+                                    'barcode': product['barcode'],
+                                  },
+                                );
+                              },
+                            ),
+                          );
+                        },
+                      ),
+      ),
+    );
+  }
+}
+
 class ProductPhotosSheet extends StatefulWidget {
   final Map<String, dynamic> product;
 
@@ -2485,15 +3009,29 @@ class _ProductPhotosSheetState extends State<ProductPhotosSheet> {
 
     try {
       final storage = Supabase.instance.client.storage.from('product-photos');
-      final files = await storage.list(path: barcode);
-      final imageFiles = files
-          .where((file) => file.name.isNotEmpty)
-          .toList()
-        ..sort((a, b) => b.name.compareTo(a.name));
+      final shopId = DB.i._requireShopId();
+      final folder = 'shop_$shopId/$barcode';
+      final files = await storage.list(path: folder);
+      final imageFiles = <String>[];
+      for (final file in files) {
+        if (file.name.isNotEmpty) imageFiles.add('$folder/${file.name}');
+      }
+
+      // Старые фотографии магазина №1 были сохранены до разделения по магазинам.
+      // Показываем их, пока они не перенесены в новую папку.
+      if (shopId == 1) {
+        try {
+          final legacyFiles = await storage.list(path: barcode);
+          for (final file in legacyFiles) {
+            if (file.name.isNotEmpty) imageFiles.add('$barcode/${file.name}');
+          }
+        } catch (_) {}
+      }
+
+      imageFiles.sort((a, b) => b.compareTo(a));
 
       final signedUrls = <String>[];
-      for (final file in imageFiles) {
-        final path = '$barcode/${file.name}';
+      for (final path in imageFiles) {
         final url = await storage.createSignedUrl(path, 3600);
         signedUrls.add(url);
       }
@@ -2704,6 +3242,7 @@ class _ProductFormState extends State<ProductForm> {
     final storage =
         Supabase.instance.client.storage.from('product-photos');
     final uploadedPaths = <String>[];
+    final shopId = DB.i._requireShopId();
 
     for (var i = 0; i < photos.length; i++) {
       final source = File(photos[i].path);
@@ -2720,7 +3259,7 @@ class _ProductFormState extends State<ProductForm> {
               : 'image/jpeg';
 
       final path =
-          '$productBarcode/${DateTime.now().microsecondsSinceEpoch}_$i$safeExtension';
+          'shop_$shopId/$productBarcode/${DateTime.now().microsecondsSinceEpoch}_$i$safeExtension';
 
       await storage.upload(
         path,
@@ -2823,24 +3362,35 @@ class _ProductFormState extends State<ProductForm> {
       await DB.i.saveProduct(data);
 
       var uploadedPhotoCount = 0;
+
+      // Первоначальная закупка тоже записывается на сервер.
+      if (isNew && stock > 0) {
+        await DB.i._recordInitialProductInvestmentOnSupabase(
+          barcode: productBarcode,
+          quantity: stock,
+          purchasePrice: buyPrice,
+          seller: widget.user['username'].toString(),
+        );
+
+        final productRow = await DB.i.product(productBarcode);
+        if (productRow != null) {
+          final localPaths = photos.isEmpty
+              ? <String>[]
+              : await savePhotosLocally();
+
+          await DB.i.createPurchaseReport(
+            productId: productRow['id'] as int,
+            seller: widget.user['username'].toString(),
+            quantity: stock,
+            purchasePrice: buyPrice,
+            photoPaths: localPaths,
+          );
+        }
+      }
+
       if (photos.isNotEmpty) {
         final uploadedPaths = await uploadPhotosToSupabase(productBarcode);
         uploadedPhotoCount = uploadedPaths.length;
-
-        // Локальная копия остаётся для существующей истории закупок.
-        if (isNew && stock > 0) {
-          final productRow = await DB.i.product(productBarcode);
-          if (productRow != null) {
-            final localPaths = await savePhotosLocally();
-            await DB.i.createPurchaseReport(
-              productId: productRow['id'] as int,
-              seller: widget.user['username'].toString(),
-              quantity: stock,
-              purchasePrice: buyPrice,
-              photoPaths: localPaths,
-            );
-          }
-        }
       }
 
       if (!mounted) return;
@@ -4079,19 +4629,34 @@ class More extends StatelessWidget {
               );
             },
           ),
-          if (user['role'] == 'admin')
-            MoreAction(
-              title: 'Продавцы',
-              icon: Icons.manage_accounts,
-              onTap: () {
-                Navigator.push(
-                  context,
-                  MaterialPageRoute(
-                    builder: (_) => const Users(),
-                  ),
-                );
-              },
-            ),
+
+         if (user['role'] == 'admin' || hasPermission(user, 'purchase_photos'))
+  MoreAction(
+    title: 'Фото приёмки',
+    icon: Icons.photo_library,
+    onTap: () {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => const PurchasePhotosPage(),
+        ),
+      );
+    },
+  ),
+
+if (user['role'] == 'admin')
+  MoreAction(
+    title: 'Продавцы',
+    icon: Icons.manage_accounts,
+    onTap: () {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => const Users(),
+        ),
+      );
+    },
+  ),
           if (hasPermission(user, 'backup'))
             MoreAction(
               title: 'Восстановить из резервной копии',
@@ -5657,6 +6222,7 @@ class _PurchasePageState extends State<PurchasePage> {
 
     final storage = Supabase.instance.client.storage.from('product-photos');
     final uploadedPaths = <String>[];
+    final shopId = DB.i._requireShopId();
     final batchId = DateTime.now().microsecondsSinceEpoch;
 
     try {
@@ -5676,7 +6242,7 @@ class _PurchasePageState extends State<PurchasePage> {
 
         // Фото закупки кладём в папку штрихкода. Поэтому администратор
         // увидит их вместе с остальными фото этого товара.
-        final path = '$productBarcode/purchase_${batchId}_$i$safeExtension';
+        final path = 'shop_$shopId/$productBarcode/purchase_${batchId}_$i$safeExtension';
 
         await storage.upload(
           path,
@@ -5979,6 +6545,8 @@ class Users extends StatefulWidget {
 }
 
 class _UsersState extends State<Users> {
+  bool deleting = false;
+
   Future<List<Map<String, dynamic>>> load() {
     return DB.i.users();
   }
@@ -5996,6 +6564,83 @@ class _UsersState extends State<Users> {
     setState(() {});
   }
 
+  Future<void> deleteUser(Map<String, dynamic> user) async {
+    if (deleting) return;
+
+    final role = user['role']?.toString() ?? '';
+    if (role == 'admin') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Администратора удалить нельзя'),
+        ),
+      );
+      return;
+    }
+
+    final username = user['username']?.toString().trim() ?? '';
+    final fullName = user['full_name']?.toString().trim() ?? username;
+
+    if (username.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('У продавца не найден email'),
+        ),
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Удалить продавца?'),
+        content: Text(
+          'Продавец «$fullName» будет удалён из системы.\n\n'
+          'Его продажи, чеки и история операций останутся.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    setState(() => deleting = true);
+
+    try {
+      await DB.i.deleteSeller(username);
+
+      if (!mounted) return;
+
+      setState(() {});
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Продавец удалён'),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Не удалось удалить продавца: $e'),
+        ),
+      );
+    } finally {
+      if (mounted) {
+        setState(() => deleting = false);
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -6003,13 +6648,12 @@ class _UsersState extends State<Users> {
         title: const Text('Продавцы'),
         actions: [
           IconButton(
-            onPressed: () => openForm(),
+            onPressed: deleting ? null : () => openForm(),
             icon: const Icon(Icons.add),
           ),
         ],
       ),
-      body: FutureBuilder<
-          List<Map<String, dynamic>>>(
+      body: FutureBuilder<List<Map<String, dynamic>>>(
         future: load(),
         builder: (context, snapshot) {
           if (!snapshot.hasData) {
@@ -6018,7 +6662,12 @@ class _UsersState extends State<Users> {
             );
           }
 
-          final users = snapshot.data!;
+          final users = snapshot.data!
+    .where((user) =>
+        user['role'] == 'admin' ||
+        user['active'] == true ||
+        user['active'] == 1)
+    .toList();
 
           if (users.isEmpty) {
             return const Center(
@@ -6031,21 +6680,39 @@ class _UsersState extends State<Users> {
             itemCount: users.length,
             itemBuilder: (_, index) {
               final user = users[index];
+              final isAdmin = user['role']?.toString() == 'admin';
 
               return Card(
                 child: ListTile(
                   title: Text(
-                    user['full_name'].toString(),
+                    user['full_name']?.toString() ?? '',
                   ),
                   subtitle: Text(
                     '@${user['username']} • '
                     '${user['role']}'
-                    '${user['active'] == 1 ? '' : ' • выключен'}',
+                    '${user['active'] == true || user['active'] == 1
+                        ? ''
+                        : ' • выключен'}',
                   ),
-                  trailing: IconButton(
-                    onPressed: () =>
-                        openForm(user),
-                    icon: const Icon(Icons.edit),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        tooltip: 'Изменить',
+                        onPressed: deleting
+                            ? null
+                            : () => openForm(user),
+                        icon: const Icon(Icons.edit),
+                      ),
+                      if (!isAdmin)
+                        IconButton(
+                          tooltip: 'Удалить',
+                          onPressed: deleting
+                              ? null
+                              : () => deleteUser(user),
+                          icon: const Icon(Icons.delete_outline),
+                        ),
+                    ],
                   ),
                 ),
               );
@@ -6168,6 +6835,7 @@ Future<void> save() async {
           'full_name': fullName,
           'password': password.text,
           'permissions': permissions,
+          'shop_id': DB.i._requireShopId(),
         },
       );
 
@@ -6187,6 +6855,7 @@ Future<void> save() async {
           'full_name': fullName,
           'active': active ? 1 : 0,
           'permissions': jsonEncode(permissions),
+          'shop_id': DB.i._requireShopId(),
           'created_at':
               DateTime.now().toIso8601String(),
         });
@@ -6260,6 +6929,7 @@ Future<void> save() async {
         'full_name': fullName,
         'active': active,
         'permissions': permissions,
+        'shop_id': DB.i._requireShopId(),
         if (password.text.isNotEmpty)
           'password': password.text,
       },
@@ -6301,6 +6971,7 @@ Future<void> save() async {
       'full_name': fullName,
       'active': active ? 1 : 0,
       'permissions': jsonEncode(permissions),
+      'shop_id': DB.i._requireShopId(),
     });
 
     if (!mounted) return;
