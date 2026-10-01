@@ -164,6 +164,13 @@ class DB {
       'server_id',
       'INTEGER',
     );
+    // Миграция старой локальной базы: добавляем shop_id в products.
+    await _ensureColumn(
+      database,
+      'products',
+      'shop_id',
+      'INTEGER',
+    );
     await _ensureColumn(
       database,
       'operations',
@@ -782,11 +789,21 @@ final data = <String, dynamic>{
       final data = Map<String, dynamic>.from(response);
       final receiptId = (data['receipt_id'] as num?)?.toInt();
       if (receiptId != null) {
+        // receipt_id — технический ID строки Supabase, а receipt_number —
+        // нормальный номер чека, который показываем пользователю.
+        final receiptRow = await Supabase.instance.client
+            .from('receipts')
+            .select('receipt_number')
+            .eq('id', receiptId)
+            .maybeSingle();
+
+        final receiptNumber = (receiptRow?['receipt_number'] as num?)?.toInt();
+
         // Сервер уже изменил остаток и создал чек атомарно.
         // Обновляем локальный кэш только после успешного ответа сервера.
         await _syncSoldProductsToLocalCache(cart);
         notifyInventoryChanged();
-        return receiptId;
+        return receiptNumber ?? receiptId;
       }
     }
 
@@ -1194,6 +1211,106 @@ if (shopId == null) {
         'p_compensation': compensation,
       },
     );
+  }
+
+  Future<void> deleteProductCompletely({
+    required int localProductId,
+    required int serverProductId,
+    required String barcode,
+  }) async {
+    final shopId = _requireShopId();
+
+    // Получаем локальные фото, чтобы удалить их с устройства.
+    final reportRows = await db!.query(
+      'purchase_reports',
+      columns: ['id'],
+      where: 'product_id = ?',
+      whereArgs: [localProductId],
+    );
+
+    final reportIds = reportRows
+        .map((row) => (row['id'] as num).toInt())
+        .toList();
+
+    final localPhotoPaths = <String>[];
+    if (reportIds.isNotEmpty) {
+      final placeholders = List.filled(reportIds.length, '?').join(',');
+      final rows = await db!.rawQuery(
+        'SELECT file_path FROM purchase_photos '
+        'WHERE report_id IN ($placeholders)',
+        reportIds,
+      );
+      localPhotoPaths.addAll(
+        rows
+            .map((row) => row['file_path']?.toString() ?? '')
+            .where((path) => path.isNotEmpty),
+      );
+    }
+
+    // Сервер удаляет товар и его историю закупок атомарно.
+    await Supabase.instance.client.rpc(
+      'delete_product_completely',
+      params: {
+        'p_product_id': serverProductId,
+        'p_barcode': barcode,
+      },
+    );
+
+    // Удаляем фотографии товара из Supabase Storage.
+    try {
+      final storage =
+          Supabase.instance.client.storage.from('product-photos');
+      final folder = 'shop_$shopId/$barcode';
+
+      final objects = await storage.list(path: folder);
+      final paths = objects
+          .map((object) => '$folder/${object.name}')
+          .toList();
+
+      if (paths.isNotEmpty) {
+        await storage.remove(paths);
+      }
+    } catch (e) {
+      // Сам товар уже удалён. Ошибку хранения фотографий не
+      // возвращаем как ошибку удаления товара.
+      print('PRODUCT STORAGE DELETE ERROR: $e');
+    }
+
+    // Удаляем локальные фотографии и записи истории закупок.
+    await db!.transaction((txn) async {
+      if (reportIds.isNotEmpty) {
+        final placeholders = List.filled(reportIds.length, '?').join(',');
+        await txn.rawDelete(
+          'DELETE FROM purchase_photos '
+          'WHERE report_id IN ($placeholders)',
+          reportIds,
+        );
+        await txn.rawDelete(
+          'DELETE FROM purchase_reports '
+          'WHERE id IN ($placeholders)',
+          reportIds,
+        );
+      }
+
+      await txn.delete(
+        'products',
+        where: 'id = ?',
+        whereArgs: [localProductId],
+      );
+    });
+
+    for (final filePath in localPhotoPaths) {
+      try {
+        final file = File(filePath);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      } catch (e) {
+        print('LOCAL PRODUCT PHOTO DELETE ERROR: $e');
+      }
+    }
+
+    notifyInventoryChanged();
   }
 
   Future<int> purchase(
@@ -1900,7 +2017,41 @@ if (shopId == null) {
       columns: ['file_path'],
     );
 
-    // Только после успешной серверной очистки очищаем локальную SQLite.
+    // После очистки данных на сервере удаляем все фотографии магазина
+    // из Supabase Storage: товары и фото находятся в shop_<shopId>/...
+    try {
+      final storage = supabase.storage.from('product-photos');
+      final shopFolder = 'shop_$shopId';
+      final folders = await storage.list(path: shopFolder);
+      final storagePaths = <String>[];
+
+      for (final folder in folders) {
+        final barcode = folder.name.trim();
+        if (barcode.isEmpty) continue;
+
+        final objects = await storage.list(
+          path: '$shopFolder/$barcode',
+        );
+
+        for (final object in objects) {
+          final name = object.name.trim();
+          if (name.isEmpty) continue;
+          storagePaths.add('$shopFolder/$barcode/$name');
+        }
+      }
+
+      if (storagePaths.isNotEmpty) {
+        await storage.remove(storagePaths);
+      }
+    } catch (e) {
+      throw Exception(
+        'Рабочие данные удалены, но фотографии из Supabase Storage '
+        'не удалось полностью удалить: $e',
+      );
+    }
+
+    // Только после успешной серверной очистки и удаления фото
+    // очищаем локальную SQLite.
     await db!.transaction((txn) async {
       await txn.delete('receipt_items');
       await txn.delete('receipts');
@@ -2682,6 +2833,78 @@ class _ProductsState extends State<Products> {
     await load();
   }
 
+  Future<void> deleteProduct(Map<String, dynamic> product) async {
+    if (widget.user['role']?.toString() != 'admin') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Удалять товары может только администратор'),
+        ),
+      );
+      return;
+    }
+
+    final name = product['name']?.toString() ?? '';
+    final barcode = product['barcode']?.toString() ?? '';
+    final localProductId = (product['id'] as num?)?.toInt();
+    final serverProductId = (product['server_id'] as num?)?.toInt();
+
+    if (localProductId == null || serverProductId == null || barcode.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Не удалось определить товар'),
+        ),
+      );
+      return;
+    }
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Удалить товар?'),
+        content: Text(
+          'Товар «$name» будет удалён вместе с его закупочной историей, '
+          'фотографиями и штрихкодом. Это действие нельзя отменить.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Отмена'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Удалить'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true || !mounted) return;
+
+    try {
+      await DB.i.deleteProductCompletely(
+        localProductId: localProductId,
+        serverProductId: serverProductId,
+        barcode: barcode,
+      );
+
+      if (!mounted) return;
+      await load();
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Товар и связанные данные удалены'),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Не удалось удалить товар: $error'),
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     if (!hasPermission(widget.user, 'products_view')) {
@@ -2780,14 +3003,27 @@ class _ProductsState extends State<Products> {
                             'Остаток: $quantity шт.',
                           ),
                           isThreeLine: true,
-                          trailing: hasPermission(widget.user, 'products_edit')
-                              ? TextButton(
-                                  onPressed: () =>
-                                      form(product),
-                                  child:
-                                      const Text('Изменить'),
-                                )
-                              : null,
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              if (hasPermission(
+                                widget.user,
+                                'products_edit',
+                              ))
+                                TextButton(
+                                  onPressed: () => form(product),
+                                  child: const Text('Изменить'),
+                                ),
+                              if (widget.user['role']?.toString() == 'admin')
+                                IconButton(
+                                  tooltip: 'Удалить товар',
+                                  onPressed: () => deleteProduct(product),
+                                  icon: const Icon(
+                                    Icons.delete_outline,
+                                  ),
+                                ),
+                            ],
+                          ),
                         ),
                       );
                     },
@@ -5261,7 +5497,16 @@ class _ReceiptsState extends State<Receipts> {
     return '${value.day.toString().padLeft(2, '0')}.${value.month.toString().padLeft(2, '0')}.${value.year}';
   }
 
-  String receiptNumber(int id) => '#${id.toString().padLeft(6, '0')}';
+  String receiptNumber(Map<String, dynamic> receipt) {
+    final number = (receipt['receipt_number'] as num?)?.toInt();
+    if (number != null) {
+      return '#${number.toString().padLeft(6, '0')}';
+    }
+
+    // Совместимость со старыми чеками до появления receipt_number.
+    final id = (receipt['id'] as num?)?.toInt() ?? 0;
+    return '#${id.toString().padLeft(6, '0')}';
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -5373,7 +5618,7 @@ class _ReceiptsState extends State<Receipts> {
                       return Card(
                         child: ListTile(
                           leading: const CircleAvatar(child: Icon(Icons.receipt_long)),
-                          title: Text('Чек ${receiptNumber(id)}', style: const TextStyle(fontWeight: FontWeight.w900)),
+                          title: Text('Чек ${receiptNumber(receipt)}', style: const TextStyle(fontWeight: FontWeight.w900)),
                           subtitle: Text(
                             '${seller.isEmpty ? 'Продавец не указан' : seller} • ${receipt['payment_method'] ?? 'Наличные'}\n${formatDateTime(created)}',
                           ),
@@ -5436,7 +5681,13 @@ class _ReceiptDetailState extends State<ReceiptDetail> {
     };
   }
 
-  String receiptNumber(int id) {
+  String receiptNumber(Map<String, dynamic> receipt) {
+    final number = (receipt['receipt_number'] as num?)?.toInt();
+    if (number != null) {
+      return '#${number.toString().padLeft(6, '0')}';
+    }
+
+    final id = (receipt['id'] as num?)?.toInt() ?? widget.receiptId;
     return '#${id.toString().padLeft(6, '0')}';
   }
 
@@ -5444,9 +5695,7 @@ class _ReceiptDetailState extends State<ReceiptDetail> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          'Чек ${receiptNumber(widget.receiptId)}',
-        ),
+        title: const Text('Чек'),
       ),
       body: FutureBuilder<Map<String, dynamic>>(
         future: future,
@@ -5493,7 +5742,7 @@ class _ReceiptDetailState extends State<ReceiptDetail> {
                       ),
                       const SizedBox(height: 8),
                       Text(
-                        'ЧЕК ${receiptNumber(widget.receiptId)}',
+                        'ЧЕК ${receiptNumber(data['receipt'] as Map<String, dynamic>) }',
                         style: const TextStyle(
                           fontSize: 24,
                           fontWeight: FontWeight.w900,
